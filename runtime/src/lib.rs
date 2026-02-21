@@ -29,6 +29,7 @@ pub mod rent_collector;
 mod reward_info;
 pub mod runtime_config;
 pub mod serde_snapshot;
+pub mod slot_time_target;
 pub mod snapshot_bank_utils;
 pub mod snapshot_controller;
 pub mod snapshot_minimizer;

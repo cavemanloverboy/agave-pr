@@ -8,7 +8,7 @@ use {
             merkle_tree::{SIZE_OF_MERKLE_PROOF_ENTRY, get_proof_size, verify_merkle_proof},
         },
     },
-    agave_feature_set::discard_unexpected_data_complete_shreds,
+    agave_feature_set::{self as feature_set, discard_unexpected_data_complete_shreds},
     assert_matches::assert_matches,
     crossbeam_channel::unbounded,
     rand::{rng, seq::SliceRandom},
@@ -20,7 +20,11 @@ use {
     solana_message::{compiled_instruction::CompiledInstruction, v0::LoadedAddresses},
     solana_packet::PACKET_DATA_SIZE,
     solana_pubkey::Pubkey,
-    solana_runtime::bank::{Bank, RewardType},
+    solana_runtime::{
+        bank::{Bank, RewardType},
+        genesis_utils::activate_feature,
+        slot_time_target::slot_time_feature_gates,
+    },
     solana_sha256_hasher::hash,
     solana_shred_version::version_from_hash,
     solana_signature::Signature,
@@ -199,6 +203,31 @@ fn test_hashes_per_tick_for_ledger() {
 
     genesis_config.poh_config.hashes_per_tick = Some(2);
     assert_eq!(hashes_per_tick_for_ledger(&genesis_config), 2);
+
+    activate_feature(
+        &mut genesis_config,
+        feature_set::reduce_slot_time_to_200ms::id(),
+    );
+    assert_eq!(hashes_per_tick_for_ledger(&genesis_config), 2);
+
+    for ((feature_id, target), hashes_per_tick) in slot_time_feature_gates()
+        .into_iter()
+        .zip([54_687, 46_875, 39_062, 31_250])
+    {
+        let mut genesis_config = GenesisConfig::default();
+        genesis_config.poh_config.hashes_per_tick = Some(62_500);
+        genesis_config.poh_config.target_tick_duration = Duration::from_nanos(
+            (target.ns_per_slot() / u128::from(genesis_config.ticks_per_slot)) as u64,
+        );
+        activate_feature(&mut genesis_config, feature_id);
+        assert_eq!(hashes_per_tick_for_ledger(&genesis_config), hashes_per_tick);
+    }
+
+    genesis_config.poh_config.hashes_per_tick = Some(62_500);
+    assert_eq!(hashes_per_tick_for_ledger(&genesis_config), 62_500);
+
+    activate_feature(&mut genesis_config, feature_set::alpenglow::id());
+    assert_eq!(hashes_per_tick_for_ledger(&genesis_config), 62_500);
 }
 
 #[test]

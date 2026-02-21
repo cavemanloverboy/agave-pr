@@ -24,6 +24,7 @@ use {
         slot_stats::{ShredSource, SlotsStats},
         transaction_address_lookup_table_scanner::scan_transaction,
     },
+    agave_feature_set as feature_set,
     agave_snapshots::unpack_genesis_archive,
     agave_votor_messages::migration::MigrationStatus,
     assert_matches::{assert_matches, debug_assert_matches},
@@ -50,7 +51,7 @@ use {
     solana_measure::measure::Measure,
     solana_metrics::datapoint_error,
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
+    solana_runtime::{bank::Bank, slot_time_target::slot_time_feature_gates},
     solana_sha256_hasher::hashv,
     solana_signature::Signature,
     solana_signer::Signer,
@@ -396,11 +397,36 @@ impl SlotMetaWorkingSetEntry {
     }
 }
 
+/// Returns the hashes-per-tick value ledger replay should use for this genesis.
+///
+/// The `genesis_config` parameter supplies the configured PoH baseline and the
+/// set of features active at genesis. SIMD-0525 slot-time features have a
+/// one-epoch effectiveness delay, so feature accounts alone must not shorten
+/// the slot-0 ledger. If a genesis config explicitly chooses a shorter
+/// `target_tick_duration`, the matching SIMD table value is used for that
+/// genesis baseline. Alpenglow and `None` hashes-per-tick configs are left
+/// unchanged because they do not use this PoH hash pacing path.
 pub(crate) fn hashes_per_tick_for_ledger(genesis_config: &GenesisConfig) -> u64 {
     let Some(hashes_per_tick) = genesis_config.poh_config.hashes_per_tick else {
         return 0;
     };
-    hashes_per_tick
+
+    if genesis_config
+        .accounts
+        .contains_key(&feature_set::alpenglow::id())
+    {
+        return hashes_per_tick;
+    }
+
+    let genesis_ns_per_slot = genesis_config.ns_per_slot();
+    slot_time_feature_gates()
+        .into_iter()
+        .find(|(feature_id, target)| {
+            genesis_config.accounts.contains_key(feature_id)
+                && genesis_ns_per_slot == target.ns_per_slot()
+        })
+        .map(|(_, target)| target.hashes_per_tick())
+        .unwrap_or(hashes_per_tick)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

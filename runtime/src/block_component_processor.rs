@@ -473,11 +473,14 @@ impl BlockComponentProcessor {
             .map_err(|_| BlockComponentProcessorError::NanosecondClockOutOfBounds)
     }
 
-    /// Given the parent slot, parent time, slot, and default nanoseconds per
-    /// slot, calculate the lower and upper bounds for the block producer time.
-    /// We return (lower_bound, upper_bound), where both bounds are inclusive.
-    /// I.e., the working bank time is valid if lower_bound <= working_bank_time
-    /// <= upper_bound.
+    /// Given a parent slot/time and working slot, calculates inclusive block
+    /// producer timestamp bounds.
+    ///
+    /// `parent_slot` and `parent_time_nanos` describe the parent bank's
+    /// nanosecond clock. `slot` is the working bank slot being checked.
+    /// `ns_per_slot` is the active slot duration in nanoseconds. The returned
+    /// `(lower_bound, upper_bound)` accepts timestamps where
+    /// `lower_bound <= working_bank_time <= upper_bound`.
     ///
     /// Refer to
     /// https://github.com/solana-foundation/solana-improvement-documents/pull/363
@@ -500,6 +503,11 @@ impl BlockComponentProcessor {
         (min_working_bank_time, max_working_bank_time)
     }
 
+    /// Applies validated footer-derived fields to `bank`.
+    ///
+    /// `block_producer_time_nanos` updates the bank's nanosecond and seconds
+    /// clock state. `bank_hash` is stored as the expected frozen bank hash.
+    /// `reward_cert` and `final_cert_input` drive vote reward state updates.
     pub fn update_bank_with_footer_fields(
         bank: &Bank,
         block_producer_time_nanos: i64,
@@ -523,8 +531,8 @@ mod tests {
             bank::{Bank, SlotLeader},
             bank_forks::BankForks,
             genesis_utils::{activate_all_features_alpenglow, create_genesis_config},
+            slot_time_target::LEGACY_NS_PER_SLOT,
         },
-        solana_clock::DEFAULT_MS_PER_SLOT,
         solana_entry::block_component::{
             BlockFooterV1, BlockHeaderV1, UpdateParentV1, VersionedUpdateParent,
         },
@@ -532,7 +540,7 @@ mod tests {
         std::sync::{Arc, RwLock},
     };
 
-    const DEFAULT_NS_PER_SLOT: u64 = DEFAULT_MS_PER_SLOT * 1_000_000;
+    const DEFAULT_NS_PER_SLOT: u64 = LEGACY_NS_PER_SLOT as u64;
 
     fn create_test_bank() -> (Arc<Bank>, Arc<RwLock<BankForks>>) {
         let genesis_config_info = create_genesis_config(10_000);
@@ -1176,9 +1184,9 @@ mod tests {
 
     #[test]
     fn test_clock_bounds_multi_slot_gap() {
-        // For 5 slots: upper_bound = parent_time + 2 * 5 * 400ms = parent_time + 4000ms
-        // Use 2 seconds which is within bounds
-        test_clock_bounds_helper(5, |_, lower, _| lower + 2_000_000_000, true);
+        // For 5 slots: upper_bound = parent_time + 2 * 5 * 200ms = parent_time + 2000ms
+        // Use 1 second which is within bounds
+        test_clock_bounds_helper(5, |_, lower, _| lower + 1_000_000_000, true);
     }
 
     #[test]
@@ -1245,7 +1253,7 @@ mod tests {
         // Test the nanosecond_time_bounds function directly
         // diff_slots = 15 - 10 = 5
         // lower = parent_time + 1
-        // upper = parent_time + 2 * 5 * 400_000_000 = parent_time + 4_000_000_000
+        // upper = parent_time + 2 * 5 * DEFAULT_NS_PER_SLOT = parent_time + 4_000_000_000
         let parent_slot = 10;
         let parent_time = 1_000_000_000_000; // 1000 seconds in nanos
         let working_slot = 15;
@@ -1265,7 +1273,7 @@ mod tests {
         // Test with same slot (diff = 0)
         // diff_slots = 0
         // lower = parent_time + 1
-        // upper = parent_time + 2 * 0 * 400_000_000 = parent_time
+        // upper = parent_time + 2 * 0 * DEFAULT_NS_PER_SLOT = parent_time
         // Note: In this case, lower > upper, so no timestamp would be valid
         // This is expected since we shouldn't have the same slot for parent and working bank
         let parent_time = 1_000_000_000_000;

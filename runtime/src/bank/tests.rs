@@ -19,6 +19,12 @@ use {
         },
         runtime_config::RuntimeConfig,
         serde_snapshot::fields_from_stream,
+        slot_time_target::{
+            LEGACY_HASHES_PER_TICK, LEGACY_NS_PER_SLOT, LEGACY_SLOT_TIME_TARGET,
+            LEGACY_TARGET_SIGNATURES_PER_SLOT, SLOT_TIME_TARGET_200MS, SLOT_TIME_TARGET_250MS,
+            SLOT_TIME_TARGET_300MS, SLOT_TIME_TARGET_350MS, slot_time_feature_gates,
+            slot_time_feature_ids,
+        },
         stake_history::StakeHistory,
         stake_utils,
         stakes::{DeserializableStakes, InvalidCacheEntryReason, SerdeStakesToStakeFormat, Stakes},
@@ -58,7 +64,8 @@ use {
     },
     solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_cost_model::block_cost_limits::{
-        MAX_BLOCK_UNITS, MAX_BLOCK_UNITS_SIMD_0286, MAX_WRITABLE_ACCOUNT_UNITS,
+        MAX_BLOCK_ACCOUNTS_DATA_SIZE_DELTA, MAX_BLOCK_UNITS, MAX_BLOCK_UNITS_SIMD_0286,
+        MAX_VOTE_UNITS, MAX_WRITABLE_ACCOUNT_UNITS,
     },
     solana_cpi::MAX_RETURN_DATA,
     solana_epoch_schedule::{EpochSchedule, MINIMUM_SLOTS_PER_EPOCH},
@@ -5257,9 +5264,9 @@ fn test_bank_hash_consistency(deprecate_rent_exemption_threshold: bool) {
             assert_eq!(
                 bank.hash().to_string(),
                 if deprecate_rent_exemption_threshold {
-                    "748qUop2J7kyQjtYs9SDrxKRswjbeJPNT3mJqCJWmGfA"
+                    "B64W28GsStiNzjqTeKGdob5tTtyW3pcGyGdHRXehRgoL"
                 } else {
-                    "9Kr5dG4tSeS6gSboWMDHJ3GWs85uFXKh9yaHLHP73MJ4"
+                    "ChtUf7gZoKX5BV76CsgsvjGSERi6SraKUyVNpHe4T8cw"
                 },
             );
             break;
@@ -6282,6 +6289,488 @@ fn test_block_limits() {
         bank.read_cost_tracker().unwrap().get_account_limit(),
         MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_ENABLED,
         "bank created from genesis config should have new limit"
+    );
+}
+
+fn legacy_cost_tracker_limits(bank: &Bank) -> (u64, u64, u64, u64) {
+    let cost_tracker = bank.read_cost_tracker().unwrap();
+    (
+        cost_tracker.get_account_limit(),
+        cost_tracker.get_block_limit(),
+        cost_tracker.get_vote_limit(),
+        cost_tracker.get_allocated_data_size_limit(),
+    )
+}
+
+fn assert_slot_time_bank_state(
+    bank: &Bank,
+    target: SlotTimeTarget,
+    legacy_cost_limits: (u64, u64, u64, u64),
+) {
+    assert_eq!(bank.ns_per_slot, target.ns_per_slot);
+    assert_eq!(bank.hashes_per_tick, Some(target.hashes_per_tick));
+    assert_eq!(bank.ticks_per_slot, DEFAULT_TICKS_PER_SLOT);
+    assert_eq!(
+        bank.slots_per_year.to_bits(),
+        target.slots_per_year.to_bits()
+    );
+    assert_eq!(
+        bank.rent_collector.slots_per_year.to_bits(),
+        bank.slots_per_year.to_bits()
+    );
+    assert_eq!(
+        bank.fee_rate_governor.target_signatures_per_slot,
+        target.target_signatures_per_slot
+    );
+    assert_eq!(bank.max_processing_age(), MAX_PROCESSING_AGE);
+    assert_eq!(
+        bank.status_cache.read().unwrap().max_root_entries(),
+        MAX_RECENT_BLOCKHASHES
+    );
+    assert_eq!(
+        bank.partitioned_rewards_stake_account_stores_per_block,
+        target.partitioned_epoch_rewards_stake_account_stores_per_block
+    );
+    assert_eq!(
+        bank.entry_bytes_budget().slot_limit(),
+        target.max_entry_bytes_per_slot
+    );
+
+    let cost_tracker = bank.read_cost_tracker().unwrap();
+    let (account_limit, block_limit, vote_limit, data_size_limit) =
+        if target == LEGACY_SLOT_TIME_TARGET {
+            legacy_cost_limits
+        } else {
+            target.cost_limits(false)
+        };
+    assert_eq!(cost_tracker.get_account_limit(), account_limit);
+    assert_eq!(cost_tracker.get_block_limit(), block_limit);
+    assert_eq!(cost_tracker.get_vote_limit(), vote_limit);
+    assert_eq!(
+        cost_tracker.get_allocated_data_size_limit(),
+        data_size_limit
+    );
+}
+
+#[test]
+fn test_reduce_slot_time_targets_match_simd_0525_tables() {
+    assert_eq!(LEGACY_SLOT_TIME_TARGET.ns_per_slot, LEGACY_NS_PER_SLOT);
+    assert_eq!(
+        LEGACY_SLOT_TIME_TARGET.slots_per_year.to_bits(),
+        78_892_314.984f64.to_bits()
+    );
+    assert_eq!(LEGACY_SLOT_TIME_TARGET.hashes_per_tick, 62_500);
+    assert_eq!(LEGACY_SLOT_TIME_TARGET.target_signatures_per_slot, 20_000);
+    assert_eq!(
+        LEGACY_SLOT_TIME_TARGET.max_entry_bytes_per_slot,
+        20 * 1024 * 1024
+    );
+    assert_eq!(
+        LEGACY_SLOT_TIME_TARGET.cost_limits(false),
+        (
+            MAX_WRITABLE_ACCOUNT_UNITS,
+            MAX_BLOCK_UNITS,
+            MAX_VOTE_UNITS,
+            MAX_BLOCK_ACCOUNTS_DATA_SIZE_DELTA,
+        )
+    );
+    assert_eq!(
+        LEGACY_SLOT_TIME_TARGET.cost_limits(true),
+        (
+            40_000_000,
+            MAX_BLOCK_UNITS_SIMD_0286,
+            MAX_VOTE_UNITS,
+            MAX_BLOCK_ACCOUNTS_DATA_SIZE_DELTA,
+        )
+    );
+
+    for (
+        (feature_id, target),
+        (
+            expected_feature_id,
+            ns_per_slot,
+            slots_per_year,
+            hashes_per_tick,
+            target_signatures_per_slot,
+            max_block_units,
+            max_writable_account_units,
+            max_block_units_simd_0286,
+            max_writable_account_units_simd_0286,
+            max_vote_units,
+            max_block_accounts_data_size_delta,
+            max_data_shreds_per_slot,
+            max_code_shreds_per_slot,
+            max_entry_bytes_per_slot,
+            partitioned_epoch_rewards_stake_account_stores_per_block,
+        ),
+    ) in slot_time_feature_gates().into_iter().zip([
+        (
+            feature_set::reduce_slot_time_to_350ms::id(),
+            350_000_000,
+            90_162_645.696_f64,
+            54_687,
+            17_500,
+            52_500_000,
+            21_000_000,
+            87_500_000,
+            35_000_000,
+            31_500_000,
+            87_500_000,
+            28_672,
+            28_672,
+            18_350_080,
+            3_584,
+        ),
+        (
+            feature_set::reduce_slot_time_to_300ms::id(),
+            300_000_000,
+            105_189_753.312_f64,
+            46_875,
+            15_000,
+            45_000_000,
+            18_000_000,
+            75_000_000,
+            30_000_000,
+            27_000_000,
+            75_000_000,
+            24_576,
+            24_576,
+            15_728_640,
+            3_072,
+        ),
+        (
+            feature_set::reduce_slot_time_to_250ms::id(),
+            250_000_000,
+            126_227_703.974_f64,
+            39_062,
+            12_500,
+            37_500_000,
+            15_000_000,
+            62_500_000,
+            25_000_000,
+            22_500_000,
+            62_500_000,
+            20_480,
+            20_480,
+            13_107_200,
+            2_560,
+        ),
+        (
+            feature_set::reduce_slot_time_to_200ms::id(),
+            200_000_000,
+            157_784_629.968_f64,
+            31_250,
+            10_000,
+            30_000_000,
+            12_000_000,
+            50_000_000,
+            20_000_000,
+            18_000_000,
+            50_000_000,
+            16_384,
+            16_384,
+            10_485_760,
+            2_048,
+        ),
+    ]) {
+        assert_eq!(feature_id, expected_feature_id);
+        assert_eq!(target.ns_per_slot, ns_per_slot);
+        assert_eq!(target.slots_per_year.to_bits(), slots_per_year.to_bits());
+        assert_eq!(target.hashes_per_tick, hashes_per_tick);
+        assert_eq!(
+            target.target_signatures_per_slot,
+            target_signatures_per_slot
+        );
+        assert_eq!(
+            target.cost_limits(false),
+            (
+                max_writable_account_units,
+                max_block_units,
+                max_vote_units,
+                max_block_accounts_data_size_delta,
+            )
+        );
+        assert_eq!(
+            target.cost_limits(true),
+            (
+                max_writable_account_units_simd_0286,
+                max_block_units_simd_0286,
+                max_vote_units,
+                max_block_accounts_data_size_delta,
+            )
+        );
+        assert_eq!(target.max_data_shreds_per_slot, max_data_shreds_per_slot);
+        assert_eq!(target.max_code_shreds_per_slot, max_code_shreds_per_slot);
+        assert_eq!(target.max_entry_bytes_per_slot, max_entry_bytes_per_slot);
+        assert_eq!(
+            target.partitioned_epoch_rewards_stake_account_stores_per_block,
+            partitioned_epoch_rewards_stake_account_stores_per_block
+        );
+    }
+}
+
+#[test]
+fn test_reduce_slot_time_features_activate_in_order() {
+    let (mut genesis_config, _) = create_genesis_config(1_000_000);
+    genesis_config.poh_config.hashes_per_tick = Some(LEGACY_HASHES_PER_TICK);
+    genesis_config.fee_rate_governor.target_signatures_per_slot = LEGACY_TARGET_SIGNATURES_PER_SLOT;
+    let feature_account_balance =
+        std::cmp::max(genesis_config.rent.minimum_balance(Feature::size_of()), 1);
+
+    let (mut bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    let legacy_cost_limits = legacy_cost_tracker_limits(&bank);
+    assert!(!bank.slot_time_reduction_active());
+    assert_eq!(bank.hashes_per_tick, Some(LEGACY_HASHES_PER_TICK));
+
+    for (feature_id, target) in slot_time_feature_gates() {
+        let previous_target = bank.slot_time_target();
+        bank.store_account(
+            &feature_id,
+            &feature::create_account(&Feature::default(), feature_account_balance),
+        );
+
+        let activation_slot = bank
+            .epoch_schedule()
+            .get_first_slot_in_epoch(bank.epoch().saturating_add(1));
+        let activation_bank = Bank::new_from_parent_with_bank_forks(
+            &bank_forks,
+            bank,
+            SlotLeader::default(),
+            activation_slot,
+        );
+
+        assert!(activation_bank.feature_set.is_active(&feature_id));
+        assert_eq!(activation_bank.slot_time_target(), previous_target);
+        assert_slot_time_bank_state(&activation_bank, previous_target, legacy_cost_limits);
+
+        let effective_slot = activation_bank
+            .epoch_schedule()
+            .get_first_slot_in_epoch(activation_bank.epoch().saturating_add(1));
+        bank = Bank::new_from_parent_with_bank_forks(
+            &bank_forks,
+            activation_bank,
+            SlotLeader::default(),
+            effective_slot,
+        );
+        assert!(bank.slot_time_reduction_active());
+        assert_slot_time_bank_state(&bank, target, legacy_cost_limits);
+    }
+}
+
+#[test]
+fn test_reduce_slot_time_features_active_at_genesis() {
+    let (mut genesis_config, _) = create_genesis_config(1_000_000);
+    genesis_config.poh_config.hashes_per_tick = Some(LEGACY_HASHES_PER_TICK);
+    genesis_config.fee_rate_governor.target_signatures_per_slot = LEGACY_TARGET_SIGNATURES_PER_SLOT;
+    for feature_id in slot_time_feature_ids() {
+        activate_feature(&mut genesis_config, feature_id);
+    }
+
+    let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    assert!(!bank.slot_time_reduction_active());
+    assert_slot_time_bank_state(
+        &bank,
+        LEGACY_SLOT_TIME_TARGET,
+        (
+            MAX_WRITABLE_ACCOUNT_UNITS,
+            MAX_BLOCK_UNITS,
+            MAX_VOTE_UNITS,
+            MAX_BLOCK_ACCOUNTS_DATA_SIZE_DELTA,
+        ),
+    );
+
+    let effective_slot = bank.epoch_schedule().get_first_slot_in_epoch(1);
+    let bank = Bank::new_from_parent_with_bank_forks(
+        &bank_forks,
+        bank,
+        SlotLeader::default(),
+        effective_slot,
+    );
+    assert_slot_time_bank_state(
+        &bank,
+        SLOT_TIME_TARGET_200MS,
+        (
+            MAX_WRITABLE_ACCOUNT_UNITS,
+            MAX_BLOCK_UNITS,
+            MAX_VOTE_UNITS,
+            MAX_BLOCK_ACCOUNTS_DATA_SIZE_DELTA,
+        ),
+    );
+}
+
+fn bank_for_tests_200ms() -> Bank {
+    let (mut genesis_config, _) = create_genesis_config(1_000_000);
+    genesis_config.poh_config.hashes_per_tick = Some(LEGACY_HASHES_PER_TICK);
+    genesis_config.fee_rate_governor.target_signatures_per_slot = LEGACY_TARGET_SIGNATURES_PER_SLOT;
+    activate_feature(
+        &mut genesis_config,
+        feature_set::reduce_slot_time_to_200ms::id(),
+    );
+
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    let effective_slot = bank.epoch_schedule().get_first_slot_in_epoch(1);
+    bank.slot = effective_slot;
+    bank.epoch = bank.epoch_schedule().get_epoch(effective_slot);
+    bank.apply_slot_time_persistent_changes();
+    bank.apply_slot_time_runtime_changes();
+    bank
+}
+
+#[test]
+fn test_snapshot_restore_accepts_consistent_slot_time_state() {
+    let bank = bank_for_tests_200ms();
+    assert_eq!(bank.slot_time_target(), SLOT_TIME_TARGET_200MS);
+    bank.assert_slot_time_snapshot_state_matches_effective_features();
+    assert_slot_time_bank_state(
+        &bank,
+        SLOT_TIME_TARGET_200MS,
+        (
+            MAX_WRITABLE_ACCOUNT_UNITS,
+            MAX_BLOCK_UNITS,
+            MAX_VOTE_UNITS,
+            MAX_BLOCK_ACCOUNTS_DATA_SIZE_DELTA,
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "snapshot slot-time ns_per_slot mismatch")]
+fn test_snapshot_restore_rejects_inconsistent_slot_time_state() {
+    let mut bank = bank_for_tests_200ms();
+    bank.ns_per_slot = LEGACY_SLOT_TIME_TARGET.ns_per_slot;
+    bank.assert_slot_time_snapshot_state_matches_effective_features();
+}
+
+#[test]
+fn test_reduce_slot_time_with_100m_block_limits() {
+    let (mut genesis_config, _) = create_genesis_config(1_000_000);
+    genesis_config.poh_config.hashes_per_tick = Some(LEGACY_HASHES_PER_TICK);
+    genesis_config.fee_rate_governor.target_signatures_per_slot = LEGACY_TARGET_SIGNATURES_PER_SLOT;
+    activate_feature(
+        &mut genesis_config,
+        feature_set::raise_block_limits_to_100m::id(),
+    );
+    activate_feature(
+        &mut genesis_config,
+        feature_set::reduce_slot_time_to_200ms::id(),
+    );
+
+    let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    assert_eq!(
+        legacy_cost_tracker_limits(&bank),
+        LEGACY_SLOT_TIME_TARGET.cost_limits(true)
+    );
+
+    let effective_slot = bank.epoch_schedule().get_first_slot_in_epoch(1);
+    let bank = Bank::new_from_parent_with_bank_forks(
+        &bank_forks,
+        bank,
+        SlotLeader::default(),
+        effective_slot,
+    );
+    assert_eq!(bank.slot_time_target(), SLOT_TIME_TARGET_200MS);
+    assert_eq!(
+        legacy_cost_tracker_limits(&bank),
+        SLOT_TIME_TARGET_200MS.cost_limits(true)
+    );
+}
+
+#[test]
+fn test_reduce_slot_time_preserve_none_hashes() {
+    let (mut genesis_config, _) = create_genesis_config(1_000_000);
+    genesis_config.poh_config.hashes_per_tick = None;
+    activate_feature(
+        &mut genesis_config,
+        feature_set::reduce_slot_time_to_200ms::id(),
+    );
+
+    let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    assert!(!bank.slot_time_reduction_active());
+    assert_eq!(bank.hashes_per_tick, None);
+    assert_eq!(bank.ns_per_slot, LEGACY_SLOT_TIME_TARGET.ns_per_slot);
+
+    let effective_slot = bank.epoch_schedule().get_first_slot_in_epoch(1);
+    let bank = Bank::new_from_parent_with_bank_forks(
+        &bank_forks,
+        bank,
+        SlotLeader::default(),
+        effective_slot,
+    );
+    assert_eq!(bank.hashes_per_tick, None);
+    assert_eq!(bank.ns_per_slot, SLOT_TIME_TARGET_200MS.ns_per_slot);
+}
+
+#[test]
+fn test_reduce_slot_time_alpenglow_preserve_hashes() {
+    let (mut genesis_config, _) = create_genesis_config(1_000_000);
+    genesis_config.poh_config.hashes_per_tick = Some(LEGACY_HASHES_PER_TICK);
+    activate_feature(&mut genesis_config, feature_set::alpenglow::id());
+    activate_feature(
+        &mut genesis_config,
+        feature_set::reduce_slot_time_to_200ms::id(),
+    );
+
+    let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    let effective_slot = bank.epoch_schedule().get_first_slot_in_epoch(1);
+    let bank = Bank::new_from_parent_with_bank_forks(
+        &bank_forks,
+        bank,
+        SlotLeader::default(),
+        effective_slot,
+    );
+    assert_eq!(bank.ns_per_slot, SLOT_TIME_TARGET_200MS.ns_per_slot);
+    assert_eq!(bank.hashes_per_tick, Some(LEGACY_HASHES_PER_TICK));
+}
+
+#[test]
+fn test_reduce_slot_time_inflation_duration() {
+    let (mut genesis_config, _) = create_genesis_config(1_000_000);
+    genesis_config.epoch_schedule = EpochSchedule::custom(32, 32, false);
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    let mut feature_set = FeatureSet::default();
+    for ((feature_id, _), activation_slot) in
+        slot_time_feature_gates().into_iter().zip([1, 33, 65, 97])
+    {
+        feature_set.activate(&feature_id, activation_slot);
+    }
+    bank.feature_set = Arc::new(feature_set);
+
+    let expected_duration = [
+        (32, LEGACY_SLOT_TIME_TARGET),
+        (32, SLOT_TIME_TARGET_350MS),
+        (32, SLOT_TIME_TARGET_300MS),
+        (32, SLOT_TIME_TARGET_250MS),
+        (32, SLOT_TIME_TARGET_200MS),
+    ]
+    .into_iter()
+    .map(|(slots, target)| slots as f64 / target.slots_per_year)
+    .sum::<f64>();
+
+    assert_eq!(
+        bank.slot_range_duration_in_years(0, 160).to_bits(),
+        expected_duration.to_bits()
+    );
+}
+
+#[test]
+fn test_reduce_slot_time_preserve_legacy_slots_per_year() {
+    let (mut genesis_config, _) = create_genesis_config(1_000_000);
+    genesis_config.poh_config.target_tick_duration = Duration::from_millis(10);
+    let bank = Bank::new_for_tests(&genesis_config);
+    let expected_slots_per_year = genesis_config.slots_per_year();
+
+    assert_eq!(bank.ns_per_slot_at_slot(0), genesis_config.ns_per_slot());
+    assert_eq!(
+        bank.slots_per_year.to_bits(),
+        expected_slots_per_year.to_bits()
+    );
+    assert_eq!(
+        bank.epoch_duration_in_years(0).to_bits(),
+        (bank.get_slots_in_epoch(0) as f64 / expected_slots_per_year).to_bits()
+    );
+    assert_eq!(
+        bank.slot_range_duration_in_years(0, 64).to_bits(),
+        (64.0 / expected_slots_per_year).to_bits()
     );
 }
 

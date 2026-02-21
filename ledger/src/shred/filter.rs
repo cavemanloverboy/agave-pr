@@ -589,13 +589,16 @@ mod tests {
         },
         crate::{
             genesis_utils::create_genesis_config,
-            shred::{MAX_CODE_SHREDS_PER_SLOT, tests::*},
+            shred::{MAX_CODE_SHREDS_PER_SLOT, MAX_DATA_SHREDS_PER_SLOT, tests::*},
         },
         assert_matches::assert_matches,
         itertools::Itertools,
         solana_leader_schedule::SlotLeader,
         solana_perf::packet::{Packet, PacketFlags},
-        solana_runtime::bank::Bank,
+        solana_runtime::{
+            bank::Bank,
+            slot_time_target::{slot_time_feature_gates, slot_time_feature_ids},
+        },
         std::{
             io::{Cursor, Seek, SeekFrom, Write},
             sync::Arc,
@@ -618,6 +621,26 @@ mod tests {
         } else {
             Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), slot)
         }
+    }
+
+    fn deactivate_slot_time_features(bank: &mut Bank) {
+        for feature_id in slot_time_feature_ids() {
+            bank.deactivate_feature(&feature_id);
+        }
+    }
+
+    fn shred_filter_for_features(
+        feature_ids: impl IntoIterator<Item = Pubkey>,
+    ) -> (ShredFilterContext, Slot) {
+        let genesis_config = create_genesis_config(1).genesis_config;
+        let mut root_bank = Bank::new_for_tests(&genesis_config);
+        deactivate_slot_time_features(&mut root_bank);
+        for feature_id in feature_ids {
+            root_bank.activate_feature(&feature_id);
+        }
+        let first_epoch_slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+        let (root_bank, _) = root_bank.wrap_with_bank_forks_for_tests();
+        (ShredFilterContext::new(root_bank, 0), first_epoch_slot)
     }
 
     #[test_case(true ; "last_in_slot")]
@@ -1013,6 +1036,7 @@ mod tests {
                 .find(|shred| shred.shred_type() == shred_type)
                 .unwrap();
             let index = shred.index();
+
             let mut shred_filter_context =
                 ShredFilterContext::new(root_bank.clone(), shred_version);
             match shred_type {
@@ -1044,6 +1068,51 @@ mod tests {
             );
             assert_eq!(shred_filter_context.stats.index_out_of_bounds, 1);
         }
+    }
+
+    #[test]
+    fn test_shred_limit_for_slot_times() {
+        let (shred_filter_context, effective_slot) = shred_filter_for_features(std::iter::empty());
+        assert_eq!(
+            shred_filter_context.shred_limits(effective_slot.saturating_sub(1)),
+            ShredLimits::new(
+                MAX_DATA_SHREDS_PER_SLOT as u32,
+                MAX_DATA_SHREDS_PER_SLOT as u32,
+            )
+        );
+        assert_eq!(
+            shred_filter_context.shred_limits(effective_slot),
+            ShredLimits::new(
+                MAX_DATA_SHREDS_PER_SLOT as u32,
+                MAX_DATA_SHREDS_PER_SLOT as u32,
+            )
+        );
+
+        for (feature_id, target) in slot_time_feature_gates() {
+            let (shred_filter_context, effective_slot) = shred_filter_for_features([feature_id]);
+            assert_eq!(
+                shred_filter_context.shred_limits(effective_slot.saturating_sub(1)),
+                ShredLimits::new(
+                    MAX_DATA_SHREDS_PER_SLOT as u32,
+                    MAX_DATA_SHREDS_PER_SLOT as u32,
+                )
+            );
+            assert_eq!(
+                shred_filter_context.shred_limits(effective_slot),
+                ShredLimits::new(
+                    target.max_data_shreds_per_slot(),
+                    target.max_code_shreds_per_slot(),
+                )
+            );
+        }
+
+        let [reduce_to_350ms, _, _, reduce_to_200ms] = slot_time_feature_ids();
+        let (shred_filter_context, effective_slot) =
+            shred_filter_for_features([reduce_to_350ms, reduce_to_200ms]);
+        assert_eq!(
+            shred_filter_context.shred_limits(effective_slot),
+            ShredLimits::new(16_384, 16_384)
+        );
     }
 
     #[test]

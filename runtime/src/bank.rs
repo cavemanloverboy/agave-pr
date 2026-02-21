@@ -56,6 +56,9 @@ use {
         rent_collector::RentCollector,
         reward_info::RewardInfo,
         runtime_config::RuntimeConfig,
+        slot_time_target::{
+            DEFAULT_MAX_ENTRY_BYTES_PER_SLOT, LEGACY_SLOT_TIME_TARGET, SlotTimeTarget,
+        },
         stake_account::StakeAccount,
         stake_history::StakeHistory as CowStakeHistory,
         stake_weighted_timestamp::{
@@ -107,11 +110,7 @@ use {
     solana_cluster_type::ClusterType,
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions,
-    solana_cost_model::{
-        block_cost_limits::simd_0286_block_limit,
-        cost_tracker::CostTracker,
-        shred_limit::{DEFAULT_MAX_CODE_SHREDS_PER_SLOT, DEFAULT_MAX_DATA_SHREDS_PER_SLOT},
-    },
+    solana_cost_model::cost_tracker::CostTracker,
     solana_epoch_info::EpochInfo,
     solana_epoch_schedule::EpochSchedule,
     solana_feature_gate_interface as feature,
@@ -174,7 +173,6 @@ use {
     solana_system_transaction as system_transaction,
     solana_sysvar::{self as sysvar, SysvarSerialize, last_restart_slot::LastRestartSlot},
     solana_sysvar_id::SysvarId,
-    solana_time_utils::years_as_slots,
     solana_transaction::{
         Transaction, TransactionVerificationMode,
         sanitized::{MAX_TX_ACCOUNT_LOCKS, MessageHash, SanitizedTransaction},
@@ -734,9 +732,6 @@ impl BankFieldsToSerialize {
 pub enum RewardCalculationEvent<'a, 'b> {
     Staking(&'a Pubkey, &'b InflationPointCalculationEvent),
 }
-/// Default maximum serialized entry bytes a bank may accept in one slot.
-pub const DEFAULT_MAX_ENTRY_BYTES_PER_SLOT: u64 = 20 * 1024 * 1024; // 20 MiB
-
 /// type alias is not supported for trait in rust yet. As a workaround, we define the
 /// `RewardCalcTracer` trait explicitly and implement it on any type that implement
 /// `Fn(&RewardCalculationEvent) + Send + Sync`.
@@ -2152,20 +2147,7 @@ impl Bank {
              snapshot and genesis.bin might pertain to different clusters"
         );
         assert_eq!(bank.ticks_per_slot, genesis_config.ticks_per_slot);
-        assert_eq!(
-            bank.ns_per_slot,
-            genesis_config.poh_config.target_tick_duration.as_nanos()
-                * genesis_config.ticks_per_slot as u128
-        );
         assert_eq!(bank.max_tick_height, (bank.slot + 1) * bank.ticks_per_slot);
-        assert_eq!(
-            bank.slots_per_year,
-            years_as_slots(
-                1.0,
-                &genesis_config.poh_config.target_tick_duration,
-                bank.ticks_per_slot,
-            )
-        );
         assert_eq!(bank.epoch_schedule, genesis_config.epoch_schedule);
 
         bank.initialize_after_snapshot_restore(|| rewards_calculation_thread_pool);
@@ -2653,18 +2635,149 @@ impl Bank {
         });
     }
 
+    /// Returns the first slot where a slot-time feature may affect bank state.
+    ///
+    /// SIMD-0525 separates feature activation from feature effectiveness. A
+    /// gate that activates in epoch E is only effective starting at the first
+    /// slot of epoch E + 1 so shred filters have a full epoch of advance notice
+    /// before enforcing lower shred limits.
+    fn slot_time_feature_effective_slot(&self, activation_slot: Slot) -> Slot {
+        let activation_epoch = self.epoch_schedule().get_epoch(activation_slot);
+        self.epoch_schedule()
+            .get_first_slot_in_epoch(activation_epoch.saturating_add(1))
+    }
+
+    /// Returns effective slot-time feature transitions sorted by slot and target
+    /// duration.
+    ///
+    /// The sorted event list lets historical time calculations account for
+    /// slot-time changes that occurred between two slots.
+    fn slot_time_feature_effective_events(&self) -> Vec<(Slot, SlotTimeTarget)> {
+        let mut events = crate::slot_time_target::slot_time_feature_gates()
+            .into_iter()
+            .filter_map(|(feature_id, target)| {
+                self.feature_set
+                    .activated_slot(&feature_id)
+                    .map(|slot| (self.slot_time_feature_effective_slot(slot), target))
+            })
+            .collect::<Vec<_>>();
+        events.sort_by_key(|(slot, target)| (*slot, target.ns_per_slot));
+        events
+    }
+
+    /// Returns the fastest slot-time target effective at `slot`.
+    fn slot_time_target_at_slot(&self, slot: Slot) -> SlotTimeTarget {
+        crate::slot_time_target::slot_time_feature_gates()
+            .into_iter()
+            .filter_map(|(feature_id, target)| {
+                self.feature_set
+                    .activated_slot(&feature_id)
+                    .map(|activation_slot| {
+                        (
+                            self.slot_time_feature_effective_slot(activation_slot),
+                            target,
+                        )
+                    })
+            })
+            .filter(|(effective_slot, _)| *effective_slot <= slot)
+            .map(|(_, target)| target)
+            .min_by_key(|target| target.ns_per_slot)
+            .unwrap_or(LEGACY_SLOT_TIME_TARGET)
+    }
+
+    /// Returns this bank's current effective slot-time target.
+    fn slot_time_target(&self) -> SlotTimeTarget {
+        self.slot_time_target_at_slot(self.slot())
+    }
+
+    /// Returns the effective slot duration for `slot` based on this bank's known feature state.
+    pub fn ns_per_slot_at_slot(&self, slot: Slot) -> u128 {
+        let target = self.slot_time_target_at_slot(slot);
+        if target == LEGACY_SLOT_TIME_TARGET
+            && !crate::slot_time_target::slot_time_feature_ids()
+                .iter()
+                .any(|feature_id| self.feature_set.activated_slot(feature_id).is_some())
+        {
+            self.ns_per_slot
+        } else {
+            target.ns_per_slot
+        }
+    }
+
+    /// Returns the shortest slot-time target effective for this bank.
+    ///
+    /// Consumers outside runtime use this accessor instead of duplicating
+    /// slot-time feature-gate knowledge. If multiple slot-time hops are active,
+    /// the shortest effective target wins.
+    pub fn active_slot_time_ns(&self) -> u128 {
+        self.slot_time_target().ns_per_slot
+    }
+
+    /// Returns slots/year for a specific slot-time `target`.
+    fn slots_per_year_for_target(&self, target: SlotTimeTarget) -> f64 {
+        // Preserve custom genesis timing until a slot-time feature is active;
+        // SIMD-0525 table values define the legacy baseline once a staged
+        // transition exists.
+        let preserve_custom_legacy_timing = target == LEGACY_SLOT_TIME_TARGET
+            && self.slot_time_feature_effective_events().is_empty();
+        if preserve_custom_legacy_timing {
+            self.slots_per_year
+        } else {
+            target.slots_per_year
+        }
+    }
+
+    /// Returns slots/year for the slot-time target active at `epoch` start.
+    fn slots_per_year_for_epoch(&self, epoch: Epoch) -> f64 {
+        let first_slot = self.epoch_schedule().get_first_slot_in_epoch(epoch);
+        self.slots_per_year_for_target(self.slot_time_target_at_slot(first_slot))
+    }
+
+    /// Returns the wall-clock duration in years for `[start_slot, end_slot)`.
+    ///
+    /// Slot-time effective events inside the range split the calculation so
+    /// inflation uses elapsed wall-clock time rather than raw slot count.
+    fn slot_range_duration_in_years(&self, start_slot: Slot, end_slot: Slot) -> f64 {
+        if start_slot >= end_slot {
+            return 0.0;
+        }
+
+        let mut cursor = start_slot;
+        let mut target = LEGACY_SLOT_TIME_TARGET;
+        let mut duration = 0.0;
+
+        for (effective_slot, effective_target) in self.slot_time_feature_effective_events() {
+            if effective_slot <= start_slot {
+                if effective_target.ns_per_slot < target.ns_per_slot {
+                    target = effective_target;
+                }
+                continue;
+            }
+            if effective_slot >= end_slot {
+                break;
+            }
+
+            duration += (effective_slot - cursor) as f64 / self.slots_per_year_for_target(target);
+            cursor = effective_slot;
+            if effective_target.ns_per_slot < target.ns_per_slot {
+                target = effective_target;
+            }
+        }
+
+        duration + (end_slot - cursor) as f64 / self.slots_per_year_for_target(target)
+    }
+
+    /// Returns epoch duration in years for the slot-time target active at epoch
+    /// start.
     pub fn epoch_duration_in_years(&self, epoch: Epoch) -> f64 {
-        // period: time that has passed as a fraction of a year, basically the length of
-        //  an epoch as a fraction of a year
-        //  calculated as: slots_elapsed / (slots / year)
-        self.epoch_schedule().get_slots_in_epoch(epoch) as f64 / self.slots_per_year
+        self.epoch_schedule().get_slots_in_epoch(epoch) as f64
+            / self.slots_per_year_for_epoch(epoch)
     }
 
-    /// Returns the slot duration to use for `slot`.
-    pub fn ns_per_slot_at_slot(&self, _slot: Slot) -> u128 {
-        self.ns_per_slot
-    }
-
+    /// Returns the bank-scoped maximum processing age for recent blockhashes.
+    ///
+    /// The value is stored on the bank so future slot-time migrations can make
+    /// it feature-gated and sticky across snapshots.
     pub fn max_processing_age(&self) -> usize {
         self.max_processing_age
     }
@@ -2689,22 +2802,34 @@ impl Bank {
         })
     }
 
+    /// Returns slots since inflation started, aligned to the first slot used for
+    /// rewards calculation.
     fn get_inflation_num_slots(&self) -> u64 {
+        let inflation_start_slot = self.inflation_start_slot_aligned_to_rewards();
+        self.epoch_schedule()
+            .get_first_slot_in_epoch(self.epoch())
+            .saturating_sub(inflation_start_slot)
+    }
+
+    /// Returns the inflation rewards start slot aligned to an epoch boundary.
+    fn inflation_start_slot_aligned_to_rewards(&self) -> Slot {
         let inflation_activation_slot = self.get_inflation_start_slot();
-        // Normalize inflation_start to align with the start of rewards accrual.
-        let inflation_start_slot = self.epoch_schedule().get_first_slot_in_epoch(
+        self.epoch_schedule().get_first_slot_in_epoch(
             self.epoch_schedule()
                 .get_epoch(inflation_activation_slot)
                 .saturating_sub(1),
-        );
-        self.epoch_schedule().get_first_slot_in_epoch(self.epoch()) - inflation_start_slot
+        )
     }
 
+    /// Returns the elapsed inflation time in years, accounting for slot-time
+    /// changes since inflation started.
     pub fn slot_in_year_for_inflation(&self) -> f64 {
         let num_slots = self.get_inflation_num_slots();
-
-        // calculated as: num_slots / (slots / year)
-        num_slots as f64 / self.slots_per_year
+        let inflation_start_slot = self.inflation_start_slot_aligned_to_rewards();
+        self.slot_range_duration_in_years(
+            inflation_start_slot,
+            inflation_start_slot.saturating_add(num_slots),
+        )
     }
 
     /// For a given `capitalization` (total_supply in lamports) and `epoch`, returns the
@@ -4537,22 +4662,138 @@ impl Bank {
         self.rc.accounts.clone()
     }
 
+    /// Returns true when this bank is using any non-legacy slot-time target.
+    pub fn slot_time_reduction_active(&self) -> bool {
+        self.slot_time_target() != LEGACY_SLOT_TIME_TARGET
+    }
+
+    /// Recomputes cost tracker limits from active feature state.
+    ///
+    /// Block/account/vote/data-size limits are selected from the SIMD-0525
+    /// table for the effective slot-time target.
     fn apply_cost_tracker_limits_for_active_features(&mut self) {
+        let target = self.slot_time_target();
+        let raise_block_limits_to_100m = self
+            .feature_set
+            .is_active(&feature_set::raise_block_limits_to_100m::id());
+        let (account_cost_limit, block_cost_limit, vote_cost_limit, data_size_limit) =
+            target.cost_limits(raise_block_limits_to_100m);
+
         let mut cost_tracker = self.write_cost_tracker().unwrap();
-        let block_cost_limit = if self.feature_set.snapshot().raise_block_limits_to_100m {
-            simd_0286_block_limit()
-        } else {
-            cost_tracker.get_block_limit()
-        };
-        let account_cost_limit = block_cost_limit.saturating_mul(40).saturating_div(100);
-        let vote_cost_limit = cost_tracker.get_vote_limit();
-        let allocated_data_size_limit = cost_tracker.get_allocated_data_size_limit();
         cost_tracker.set_limits(
             account_cost_limit,
             block_cost_limit,
             vote_cost_limit,
-            allocated_data_size_limit,
+            data_size_limit,
         );
+    }
+
+    /// Recomputes this bank's effective partitioned-reward write budget.
+    ///
+    /// Non-legacy slot-time targets use the explicit SIMD-0525 table values.
+    /// Legacy banks preserve the accounts-db config so tests and custom genesis
+    /// configs that do not activate slot-time features keep their configured
+    /// behavior.
+    fn apply_partitioned_epoch_rewards_config_for_active_features(&mut self) {
+        let target = self.slot_time_target();
+        self.partitioned_rewards_stake_account_stores_per_block =
+            if target == LEGACY_SLOT_TIME_TARGET {
+                self.rc
+                    .accounts
+                    .accounts_db
+                    .partitioned_epoch_rewards_config
+                    .stake_account_stores_per_block
+            } else {
+                target.partitioned_epoch_rewards_stake_account_stores_per_block
+            };
+    }
+
+    /// Applies slot-time changes for fields serialized into snapshots.
+    ///
+    /// `ns_per_slot`, `slots_per_year`, PoH hashes-per-tick, and target
+    /// signatures per slot are persisted bank fields, so this function updates
+    /// them once a slot-time feature reaches its delayed effective slot.
+    /// Snapshot restore relies on the stored values and only reapplies
+    /// non-persisted runtime state.
+    fn apply_slot_time_persistent_changes(&mut self) {
+        let target = self.slot_time_target();
+        if target.ns_per_slot == self.ns_per_slot {
+            return;
+        }
+
+        self.ns_per_slot = target.ns_per_slot;
+        self.slots_per_year = target.slots_per_year;
+        self.rent_collector.slots_per_year = target.slots_per_year;
+        if !self.feature_set.is_active(&feature_set::alpenglow::id())
+            && self.hashes_per_tick.is_some()
+        {
+            self.hashes_per_tick = Some(target.hashes_per_tick);
+        }
+        if self.fee_rate_governor.target_signatures_per_slot > 0 {
+            self.fee_rate_governor.target_signatures_per_slot = target.target_signatures_per_slot;
+        }
+    }
+
+    /// Verifies slot-time fields rebuilt at snapshot restore match the effective target.
+    ///
+    /// Legacy timing can be customized at genesis, so the check only applies
+    /// after a SIMD-0525 target is effective. At that point persisted timing
+    /// fields must have been updated before snapshotting, and runtime-only
+    /// limits must have been rebuilt from the same target.
+    fn assert_slot_time_snapshot_state_matches_effective_features(&self) {
+        let target = self.slot_time_target();
+        if target == LEGACY_SLOT_TIME_TARGET {
+            return;
+        }
+
+        assert_eq!(
+            self.ns_per_slot, target.ns_per_slot,
+            "snapshot slot-time ns_per_slot mismatch"
+        );
+        assert_eq!(
+            self.slots_per_year.to_bits(),
+            target.slots_per_year.to_bits(),
+            "snapshot slot-time slots_per_year mismatch"
+        );
+        assert_eq!(
+            self.rent_collector.slots_per_year.to_bits(),
+            target.slots_per_year.to_bits(),
+            "snapshot slot-time rent_collector.slots_per_year mismatch"
+        );
+        if !self.feature_set.is_active(&feature_set::alpenglow::id())
+            && self.hashes_per_tick.is_some()
+        {
+            assert_eq!(
+                self.hashes_per_tick,
+                Some(target.hashes_per_tick),
+                "snapshot slot-time hashes_per_tick mismatch"
+            );
+        }
+        if self.fee_rate_governor.target_signatures_per_slot > 0 {
+            assert_eq!(
+                self.fee_rate_governor.target_signatures_per_slot,
+                target.target_signatures_per_slot,
+                "snapshot slot-time target_signatures_per_slot mismatch"
+            );
+        }
+        assert_eq!(
+            self.entry_bytes_budget().slot_limit(),
+            target.max_entry_bytes_per_slot,
+            "snapshot slot-time entry byte budget mismatch"
+        );
+    }
+
+    /// Applies slot-time changes for runtime-only fields.
+    ///
+    /// Entry byte budget, cost tracker limits, and the bank-scoped partitioned
+    /// rewards budget are reconstructed after genesis and snapshot restore.
+    /// This function is idempotent because every value is selected from current
+    /// feature state and the explicit SIMD-0525 table.
+    fn apply_slot_time_runtime_changes(&mut self) {
+        self.entry_bytes_consumed =
+            EntryBytesBudget::new(self.slot_time_target().max_entry_bytes_per_slot);
+        self.apply_cost_tracker_limits_for_active_features();
+        self.apply_partitioned_epoch_rewards_config_for_active_features();
     }
 
     fn apply_simd_0339_invoke_cost_changes(&mut self) {
@@ -4576,11 +4817,10 @@ impl Bank {
             Arc::new(reserved_keys)
         };
 
-        // Cost-Tracker is not serialized in snapshot or any configs.
-        // We must apply previously activated features related to limits here
+        // Many fields are not serialized in snapshot or any configs.
+        // We must apply previously activated features related to values here
         // so that the initial bank state is consistent with the feature set.
-        // Cost-tracker limits are propagated through children banks.
-        self.apply_cost_tracker_limits_for_active_features();
+        self.apply_slot_time_runtime_changes();
         self.apply_simd_0339_invoke_cost_changes();
 
         let program_runtime_environment =
@@ -4872,16 +5112,16 @@ impl Bank {
     ///
     /// Limit changes are delayed by an epoch, so a root bank can derive the
     /// limit for any slot inside the shred intake window.
-    pub fn max_data_shreds_per_slot_for_slot(&self, _slot: Slot) -> u32 {
-        DEFAULT_MAX_DATA_SHREDS_PER_SLOT
+    pub fn max_data_shreds_per_slot_for_slot(&self, slot: Slot) -> u32 {
+        self.slot_time_target_at_slot(slot).max_data_shreds_per_slot
     }
 
     /// Returns the code shred limit applicable to `slot`.
     ///
     /// Limit changes are delayed by an epoch, so a root bank can derive the
     /// limit for any slot inside the shred intake window.
-    pub fn max_code_shreds_per_slot_for_slot(&self, _slot: Slot) -> u32 {
-        DEFAULT_MAX_CODE_SHREDS_PER_SLOT
+    pub fn max_code_shreds_per_slot_for_slot(&self, slot: Slot) -> u32 {
+        self.slot_time_target_at_slot(slot).max_code_shreds_per_slot
     }
 
     pub fn max_entry_bytes_per_slot(&self) -> u64 {
@@ -5756,11 +5996,13 @@ impl Bank {
         self.feature_set = Arc::new(feature_set);
 
         self.apply_activated_features();
+        self.assert_slot_time_snapshot_state_matches_effective_features();
     }
 
     /// This is called from each epoch boundary
     fn compute_and_apply_new_feature_activations(&mut self) {
         let include_pending = true;
+        let previous_ns_per_slot = self.ns_per_slot;
         let (feature_set, new_feature_activations) =
             self.compute_active_feature_set(include_pending);
         self.feature_set = Arc::new(feature_set);
@@ -5846,10 +6088,13 @@ impl Bank {
             self.fee_rate_governor.burn_percent = solana_fee_calculator::DEFAULT_BURN_PERCENT;
         }
 
-        self.apply_new_builtin_program_feature_transitions(&new_feature_activations);
-        if new_feature_activations.contains(&feature_set::raise_block_limits_to_100m::id()) {
+        if self.slot_time_target().ns_per_slot != previous_ns_per_slot {
+            self.apply_slot_time_persistent_changes();
+            self.apply_slot_time_runtime_changes();
+        } else if new_feature_activations.contains(&feature_set::raise_block_limits_to_100m::id()) {
             self.apply_cost_tracker_limits_for_active_features();
         }
+        self.apply_new_builtin_program_feature_transitions(&new_feature_activations);
 
         if new_feature_activations.contains(&feature_set::replace_spl_token_with_p_token::id()) {
             if let Err(e) = self.upgrade_loader_v2_program_with_loader_v3_program(

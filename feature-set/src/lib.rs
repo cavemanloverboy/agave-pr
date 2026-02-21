@@ -52,6 +52,10 @@ pub struct FeatureSnapshot {
     pub fix_alt_bn128_multiplication_input_length: bool,
     pub formalize_loaded_transaction_data_size: bool,
     pub alpenglow: bool,
+    pub reduce_slot_time_to_350ms: bool,
+    pub reduce_slot_time_to_300ms: bool,
+    pub reduce_slot_time_to_250ms: bool,
+    pub reduce_slot_time_to_200ms: bool,
     pub disable_zk_elgamal_proof_program: bool,
     pub reenable_zk_elgamal_proof_program: bool,
     pub raise_block_limits_to_100m: bool,
@@ -155,6 +159,10 @@ impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
                 &formalize_loaded_transaction_data_size::ID,
             ),
             alpenglow: is_active(&alpenglow::ID),
+            reduce_slot_time_to_350ms: is_active(&reduce_slot_time_to_350ms::ID),
+            reduce_slot_time_to_300ms: is_active(&reduce_slot_time_to_300ms::ID),
+            reduce_slot_time_to_250ms: is_active(&reduce_slot_time_to_250ms::ID),
+            reduce_slot_time_to_200ms: is_active(&reduce_slot_time_to_200ms::ID),
             disable_zk_elgamal_proof_program: is_active(&disable_zk_elgamal_proof_program::ID),
             reenable_zk_elgamal_proof_program: is_active(&reenable_zk_elgamal_proof_program::ID),
             raise_block_limits_to_100m: is_active(&raise_block_limits_to_100m::ID),
@@ -1356,6 +1364,26 @@ pub mod raise_account_cu_limit {
     solana_pubkey::declare_id!("htsptAwi2yRoZH83SKaUXykeZGtZHgxkS2QwW1pssR8");
 }
 
+/// Feature gate for reducing slot duration to 350ms.
+pub mod reduce_slot_time_to_350ms {
+    solana_pubkey::declare_id!("iBRL2iJvhLssJveF1utbmmQGmjonmNYZALcJFEHTbUF");
+}
+
+/// Feature gate for reducing slot duration to 300ms.
+pub mod reduce_slot_time_to_300ms {
+    solana_pubkey::declare_id!("iBRLA3zvd6x9445cK1vS7xt8n6Y7DS3otfRcDdW8JRW");
+}
+
+/// Feature gate for reducing slot duration to 250ms.
+pub mod reduce_slot_time_to_250ms {
+    solana_pubkey::declare_id!("iBRLR6nG3fDi8YD4mpPTUVTgo5NaiYfZgrzokCfADP2");
+}
+
+/// Feature gate for reducing slot duration to 200ms.
+pub mod reduce_slot_time_to_200ms {
+    solana_pubkey::declare_id!("iBRLypKvvj9VEvwoTeRpbLhbW55NFR4T3GE9BUR8A16");
+}
+
 pub mod delay_commission_updates {
     solana_pubkey::declare_id!("76dHtohc2s5dR3ahJyBxs7eJJVipFkaPdih9CLgTTb4B");
 }
@@ -2434,6 +2462,22 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             alpenglow::id(),
             "SIMD-0326: Alpenglow: new consensus algorithm",
+        ),
+        (
+            reduce_slot_time_to_350ms::id(),
+            "SIMD-0525: Reduce slot time to 350ms",
+        ),
+        (
+            reduce_slot_time_to_300ms::id(),
+            "SIMD-0525: Reduce slot time to 300ms",
+        ),
+        (
+            reduce_slot_time_to_250ms::id(),
+            "SIMD-0525: Reduce slot time to 250ms",
+        ),
+        (
+            reduce_slot_time_to_200ms::id(),
+            "SIMD-0525: Reduce slot time to 200ms",
         ),
         (
             disable_zk_elgamal_proof_program::id(),

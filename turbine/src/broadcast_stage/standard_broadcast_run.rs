@@ -627,6 +627,7 @@ impl BroadcastRun for StandardBroadcastRun {
             receiver,
             &mut self.carryover_entry,
             &mut process_stats,
+            broadcast_utils::entry_coalesce_duration(self.num_batches == 0),
         )?;
         // TODO: Confirm that last chunk of coding shreds
         // will not be lost or delayed for too long.

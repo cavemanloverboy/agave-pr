@@ -949,7 +949,6 @@ mod tests {
             fs::remove_file,
             path::PathBuf,
             sync::{Arc, RwLock},
-            time::Instant,
         },
     };
 
@@ -1258,12 +1257,11 @@ mod tests {
             parent_block: Block,
         ) {
             let mut new_ops = EventHandler::handle_event(
-                VotorEvent::ProduceWindow(LeaderWindowInfo {
+                VotorEvent::ProduceWindow(LeaderWindowInfo::new(
                     start_slot,
                     end_slot,
                     parent_block,
-                    block_timer: Instant::now(),
-                }),
+                )),
                 &self.timer_manager,
                 &self.shared_context,
                 &mut self.voting_context,

@@ -43,9 +43,51 @@ impl Poh {
     }
 
     pub fn reset(&mut self, hash: Hash, hashes_per_tick: Option<u64>) {
+        self.reset_with_slot_start(hash, hashes_per_tick, Instant::now());
+    }
+
+    pub fn reset_with_slot_start(
+        &mut self,
+        hash: Hash,
+        hashes_per_tick: Option<u64>,
+        slot_start_time: Instant,
+    ) {
         // retains ticks_per_slot: this cannot change without restarting the validator
         let tick_number = 0;
-        *self = Poh::new_with_slot_info(hash, hashes_per_tick, tick_number);
+        let hashes_per_tick = hashes_per_tick.unwrap_or(LOW_POWER_MODE);
+        assert!(hashes_per_tick > 1);
+        self.hash = hash;
+        self.num_hashes = 0;
+        self.hashes_per_tick = hashes_per_tick;
+        self.remaining_hashes_until_tick = hashes_per_tick;
+        self.tick_number = tick_number;
+        self.slot_start_time = slot_start_time;
+    }
+
+    pub fn slot_start_time(&self) -> Instant {
+        self.slot_start_time
+    }
+
+    pub fn set_slot_start_time(&mut self, slot_start_time: Instant) {
+        self.slot_start_time = slot_start_time;
+    }
+
+    pub fn tick_number(&self) -> u64 {
+        self.tick_number
+    }
+
+    pub fn num_hashes(&self) -> u64 {
+        self.num_hashes
+    }
+
+    pub fn ideal_time_offset_ns(&self, target_ns_per_tick: u64) -> u64 {
+        target_ns_per_tick
+            .saturating_mul(self.tick_number)
+            .saturating_add(
+                target_ns_per_tick
+                    .saturating_mul(self.num_hashes)
+                    .saturating_div(self.hashes_per_tick),
+            )
     }
 
     pub fn hashes_per_tick(&self) -> u64 {

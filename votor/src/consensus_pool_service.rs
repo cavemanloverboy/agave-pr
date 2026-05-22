@@ -440,12 +440,11 @@ impl ConsensusPoolService {
                 )
             }
             BlockProductionParent::Parent(parent_block) => {
-                events.push(VotorEvent::ProduceWindow(LeaderWindowInfo {
+                events.push(VotorEvent::ProduceWindow(LeaderWindowInfo::new(
                     start_slot,
                     end_slot,
                     parent_block,
-                    block_timer: Instant::now(),
-                }));
+                )));
                 stats.parent_ready_produce_window += 1;
             }
         }

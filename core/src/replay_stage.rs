@@ -4227,12 +4227,11 @@ impl ReplayStage {
         };
 
         let end_slot = next_slot.saturating_add(NUM_CONSECUTIVE_LEADER_SLOTS - 1);
-        let leader_window_info = LeaderWindowInfo {
-            start_slot: next_slot,
+        let leader_window_info = LeaderWindowInfo::new(
+            next_slot,
             end_slot,
-            parent_block: (bank.slot(), block_id),
-            block_timer: Instant::now(),
-        };
+            (bank.slot(), block_id),
+        );
 
         Self::try_send_latest_optimistic_parent(
             optimistic_parent_sender,

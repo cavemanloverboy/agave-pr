@@ -223,6 +223,13 @@ pub struct PohRecorder {
     /// to complete the block. This tick will not be verified, and we use this
     /// flag to unset hashes_per_tick
     alpenglow_enabled: bool,
+
+    /// Tower: ideal start of the last anchored leader slot.
+    tower_last_ideal_slot_start: Option<Instant>,
+    /// Tower: slot number paired with `tower_last_ideal_slot_start`.
+    tower_last_anchored_slot: Option<Slot>,
+    /// Tower: `leader_first_tick_height` we last anchored at grace-period entry.
+    tower_ideal_anchor_tick: Option<u64>,
 }
 
 impl PohRecorder {
@@ -306,6 +313,9 @@ impl PohRecorder {
                 is_exited,
                 entries: Vec::with_capacity(64),
                 alpenglow_enabled: false,
+                tower_last_ideal_slot_start: None,
+                tower_last_anchored_slot: None,
+                tower_ideal_anchor_tick: None,
             },
             working_bank_receiver,
         )
@@ -314,10 +324,24 @@ impl PohRecorder {
     // synchronize PoH with a bank
     pub fn reset(&mut self, reset_bank: Arc<Bank>, next_leader_slot: Option<(Slot, Slot)>) {
         self.clear_bank(false);
-        let tick_height = self.reset_poh(reset_bank, true);
 
         let (leader_first_tick_height, leader_last_tick_height, grace_ticks) =
             Self::compute_leader_slot_tick_heights(next_leader_slot, self.ticks_per_slot);
+        // Tick path may anchor at grace before replay reset lands on the same tick; re-anchoring
+        // after reset_poh(Instant::now()) would discard the paced slot_start_time and shift the
+        // ideal grid forward.
+        let already_anchored_at_grace = !self.alpenglow_enabled
+            && leader_first_tick_height.is_some()
+            && self.tower_ideal_anchor_tick == leader_first_tick_height
+            && next_leader_slot
+                .is_some_and(|(slot, _)| self.tower_last_anchored_slot == Some(slot));
+        let preserved_slot_start_time = if already_anchored_at_grace {
+            Some(self.poh.lock().unwrap().slot_start_time())
+        } else {
+            None
+        };
+
+        let tick_height = self.reset_poh(reset_bank, true);
         self.grace_ticks = grace_ticks;
 
         // Above call to `clear_bank` did not set the shared state,
@@ -331,6 +355,33 @@ impl PohRecorder {
         )));
 
         self.leader_last_tick_height = leader_last_tick_height;
+
+        if let Some(slot_start_time) = preserved_slot_start_time {
+            self.poh.lock().unwrap().set_slot_start_time(slot_start_time);
+        }
+
+        let preserve_tower_anchor = !already_anchored_at_grace
+            && !self.alpenglow_enabled
+            && next_leader_slot
+                .map(|(next_slot, _)| {
+                    self.tower_last_anchored_slot
+                        .zip(self.tower_last_ideal_slot_start)
+                        .is_some_and(|(last_slot, _)| {
+                            next_slot > last_slot
+                                && self.is_consecutive_same_leader_slot(next_slot)
+                        })
+                })
+                .unwrap_or(false);
+        if !preserve_tower_anchor && !already_anchored_at_grace {
+            self.tower_last_ideal_slot_start = None;
+            self.tower_last_anchored_slot = None;
+        }
+        if already_anchored_at_grace {
+            // Keep tower_ideal_anchor_tick and tower_last_*; tick() dedup prevents a third anchor.
+        } else {
+            self.tower_ideal_anchor_tick = None;
+            self.maybe_anchor_tower_ideal_slot_at_grace_start();
+        }
     }
 
     /// Send the block marker to be broadcast
@@ -445,6 +496,10 @@ impl PohRecorder {
             self.shared_leader_state.increment_tick_height();
             trace!("tick_height {}", self.tick_height());
 
+            if !self.alpenglow_enabled {
+                self.maybe_anchor_tower_ideal_slot_at_grace_start();
+            }
+
             if self
                 .shared_leader_state
                 .load()
@@ -505,8 +560,6 @@ impl PohRecorder {
         )));
         self.working_bank = Some(working_bank);
 
-        // TODO: adjust the working_bank.start time based on number of ticks
-        // that have already elapsed based on current tick height.
         let _ = self.flush_cache(false, None);
     }
 
@@ -564,6 +617,131 @@ impl PohRecorder {
         self.notify_replay_wakeup();
     }
 
+    /// Tower: anchor the leader slot ideal start when PoH reaches the grace period
+    /// (one tick before `leader_first_tick_height`), after hashing through from reset.
+    ///
+    /// Convention: `ideal_slot_start` is the wall-clock at which the **first hash of
+    /// the slot** lands — i.e., the very next hash after `grace_start_tick` fired.
+    /// `ideal_end = ideal_slot_start + ns_per_slot` is when the slot's last tick
+    /// completes. Under this convention the slot spans exactly `ns_per_slot` of
+    /// wall clock from first hash to last tick.
+    ///
+    /// At anchor time PoH is at `(tick_number = poh_tn_now, num_hashes = 0)` and the
+    /// next computation is the first hash of this slot. So the earliest realizable
+    /// `ideal_slot_start` is simply `now`.
+    ///
+    /// Strict never-lagged consecutive starts: if the stepped ideal (from the previous
+    /// anchor's grid) would land before `now`, we clamp the anchor forward to `now`.
+    /// PoH then paces normally from the clamped anchor (no back-dated catch-up
+    /// hashing), and the next consecutive slot in the same window steps from the
+    /// clamped point rather than the pure grid. This guarantees `lagged_anchor_ms == 0`
+    /// for the realized anchor, trading grid purity for a clean lag metric and
+    /// bounded per-slot skew. `pre_clamp_lag_ms` reports the raw stepped lag for
+    /// diagnostics.
+    fn maybe_anchor_tower_ideal_slot_at_grace_start(&mut self) {
+        if self.alpenglow_enabled || self.has_bank() {
+            return;
+        }
+        let Some(leader_first_tick) = self.leader_first_tick_height() else {
+            return;
+        };
+        if self.tower_ideal_anchor_tick == Some(leader_first_tick) {
+            return;
+        }
+        let grace_start_tick = leader_first_tick.saturating_sub(1);
+        if self.tick_height() != grace_start_tick {
+            return;
+        }
+
+        let leader_slot = leader_first_tick.saturating_sub(1) / self.ticks_per_slot;
+        let target_tick_ns = self.target_tick_ns();
+        let ns_per_slot = self.start_bank.ns_per_slot_at_slot(leader_slot);
+        let is_consecutive = self.is_consecutive_same_leader_slot(leader_slot);
+
+        let now = Instant::now();
+        let earliest_realizable = now;
+
+        let (stepped_ideal_slot_start, slots_stepped, anchor_from_slot) = if is_consecutive {
+            match (
+                self.tower_last_ideal_slot_start,
+                self.tower_last_anchored_slot,
+            ) {
+                (Some(last_start), Some(last_slot)) if leader_slot > last_slot => {
+                    let slots_stepped = leader_slot - last_slot;
+                    let ideal = last_start.checked_add(Duration::from_nanos_u128(
+                        u128::from(slots_stepped).saturating_mul(ns_per_slot),
+                    ));
+                    (
+                        ideal.unwrap_or(earliest_realizable),
+                        slots_stepped,
+                        Some(last_slot),
+                    )
+                }
+                _ => (earliest_realizable, 1, None),
+            }
+        } else {
+            (earliest_realizable, 1, None)
+        };
+
+        // Strict never-lagged clamp: realized anchor never sits in the past.
+        let pre_clamp_lag_ms = now
+            .saturating_duration_since(stepped_ideal_slot_start)
+            .as_millis();
+        let ideal_slot_start = stepped_ideal_slot_start.max(earliest_realizable);
+        let clamped = ideal_slot_start != stepped_ideal_slot_start;
+
+        let anchor_from_slot_log = match anchor_from_slot {
+            Some(slot) => slot.to_string(),
+            None => "none".to_string(),
+        };
+
+        let mut poh = self.poh.lock().unwrap();
+        let poh_offset_ns = poh.ideal_time_offset_ns(target_tick_ns);
+        // First-hash convention: target_poh_time(last_tick) = ideal_slot_start + ns_per_slot,
+        // which gives slot_start_time = ideal_slot_start - poh_offset_ns (the `+ tick` guard
+        // from the first-tick convention drops out — it cancels with `ideal_first_tick =
+        // ideal_first_hash + tick`).
+        let Some(new_slot_start) =
+            ideal_slot_start.checked_sub(Duration::from_nanos(poh_offset_ns))
+        else {
+            return;
+        };
+        let lagged_anchor_ms = Instant::now()
+            .saturating_duration_since(ideal_slot_start)
+            .as_millis();
+        poh.set_slot_start_time(new_slot_start);
+        // Store the clamped anchor so the next consecutive slot steps from a
+        // realizable point; this is the "trades grid purity" half of strict mode.
+        self.tower_last_ideal_slot_start = Some(ideal_slot_start);
+        self.tower_last_anchored_slot = Some(leader_slot);
+        self.tower_ideal_anchor_tick = Some(leader_first_tick);
+        info!(
+            "CAVEY DEBUG: tower grace anchor slot={leader_slot} leader_first_tick={leader_first_tick} \
+             consecutive={is_consecutive} anchor_from_slot={anchor_from_slot_log} slots_stepped={slots_stepped} \
+             lagged_anchor_ms={lagged_anchor_ms} pre_clamp_lag_ms={pre_clamp_lag_ms} clamped={clamped}",
+        );
+    }
+
+    fn is_consecutive_same_leader_slot(&self, leader_slot: Slot) -> bool {
+        if leader_slot == 0 {
+            return false;
+        }
+        let prev_slot = leader_slot.saturating_sub(1);
+        let Some(curr_leader) = self
+            .leader_schedule_cache
+            .slot_leader_at(leader_slot, Some(&self.start_bank))
+        else {
+            return false;
+        };
+        let Some(prev_leader) = self
+            .leader_schedule_cache
+            .slot_leader_at(prev_slot, Some(&self.start_bank))
+        else {
+            return false;
+        };
+        curr_leader.id == prev_leader.id
+    }
+
     /// Returns tick_height - does not update the internal state for tick_height.
     #[must_use]
     fn reset_poh(&mut self, reset_bank: Arc<Bank>, reset_start_bank: bool) -> u64 {
@@ -575,7 +753,7 @@ impl PohRecorder {
         };
         let poh_hash = {
             let mut poh = self.poh.lock().unwrap();
-            poh.reset(blockhash, hashes_per_tick);
+            poh.reset_with_slot_start(blockhash, hashes_per_tick, Instant::now());
             poh.hash
         };
         info!(

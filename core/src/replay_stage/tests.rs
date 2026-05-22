@@ -3320,6 +3320,7 @@ fn test_latest_parent_coalesces() {
             end_slot: 11,
             parent_block: (7, Hash::new_unique()),
             block_timer: Instant::now(),
+            ideal_window_start: Instant::now(),
         })
         .unwrap();
 
@@ -3331,6 +3332,7 @@ fn test_latest_parent_coalesces() {
             end_slot: 15,
             parent_block: (11, Hash::new_unique()),
             block_timer: Instant::now(),
+            ideal_window_start: Instant::now(),
         },
     );
 
@@ -3345,6 +3347,7 @@ fn test_latest_parent_coalesces() {
             end_slot: 22,
             parent_block: (19, Hash::new_unique()),
             block_timer: Instant::now(),
+            ideal_window_start: Instant::now(),
         })
         .unwrap();
 
@@ -3356,6 +3359,7 @@ fn test_latest_parent_coalesces() {
             end_slot: 23,
             parent_block: (19, Hash::new_unique()),
             block_timer: Instant::now(),
+            ideal_window_start: Instant::now(),
         },
     );
 
@@ -3370,6 +3374,7 @@ fn test_latest_parent_coalesces() {
             end_slot: 23,
             parent_block: (19, Hash::new_unique()),
             block_timer: Instant::now(),
+            ideal_window_start: Instant::now(),
         })
         .unwrap();
 
@@ -3381,6 +3386,7 @@ fn test_latest_parent_coalesces() {
             end_slot: 19,
             parent_block: (15, Hash::new_unique()),
             block_timer: Instant::now(),
+            ideal_window_start: Instant::now(),
         },
     );
 

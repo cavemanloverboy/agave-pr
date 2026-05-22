@@ -20,7 +20,26 @@ pub struct LeaderWindowInfo {
     pub start_slot: Slot,
     pub end_slot: Slot,
     pub parent_block: Block,
+    /// Wall-clock time when ParentReady (or optimistic parent) was observed. Retained for sad
+    /// leader handover and metrics.
     pub block_timer: Instant,
+    /// Ideal start of the first slot in this leader window. Each slot gets one `ns_per_slot`
+    /// budget from its own ideal boundary; the anchor is set at ParentReady and stepped forward
+    /// slot-by-slot (not locked to a global grid across windows).
+    pub ideal_window_start: Instant,
+}
+
+impl LeaderWindowInfo {
+    pub fn new(start_slot: Slot, end_slot: Slot, parent_block: Block) -> Self {
+        let now = Instant::now();
+        Self {
+            start_slot,
+            end_slot,
+            parent_block,
+            block_timer: now,
+            ideal_window_start: now,
+        }
+    }
 }
 
 pub type VotorEventSender = Sender<VotorEvent>;

@@ -38,7 +38,7 @@ use {
         bank_forks::BankForks,
         bank_forks_controller::{BankForksController, BankForksControllerError},
         block_component_processor::BlockComponentProcessor,
-        leader_schedule_utils::{last_of_consecutive_leader_slots, leader_slot_index},
+        leader_schedule_utils::last_of_consecutive_leader_slots,
         validated_block_finalization::ValidatedBlockFinalizationCert,
         validated_reward_certificate::ValidatedRewardCert,
     },
@@ -357,6 +357,7 @@ fn start_loop(config: BlockCreationLoopConfig) {
             end_slot,
             parent_block: (parent_slot, parent_hash),
             block_timer,
+            ideal_window_start,
         } = info;
 
         trace!(
@@ -376,6 +377,7 @@ fn start_loop(config: BlockCreationLoopConfig) {
             parent_slot,
             parent_hash,
             block_timer,
+            ideal_window_start,
             &mut ctx,
         ) {
             // Give up on this leader window
@@ -410,10 +412,60 @@ fn reset_poh_recorder(bank: &Arc<Bank>, ctx: &LeaderContext) {
         .reset(bank.clone(), next_leader_slot);
 }
 
-/// Returns the elapsed leader-window time at which `slot` must be completed.
-fn block_timeout(bank: &Bank, slot: Slot) -> Duration {
-    Duration::from_nanos_u128(bank.ns_per_slot_at_slot(slot))
-        .saturating_mul((leader_slot_index(slot) as u32).saturating_add(1))
+/// Returns the absolute time by which the current slot must be completed.
+///
+/// Each slot receives one `ns_per_slot` budget from its own ideal start. Handoff delay before
+/// production begins consumes time within that budget but does not extend it.
+fn slot_deadline(slot_ideal_start: Instant, ns_per_slot: u128) -> Instant {
+    slot_ideal_start
+        .checked_add(Duration::from_nanos_u128(ns_per_slot))
+        .unwrap_or(slot_ideal_start)
+}
+
+/// Advance the ideal start for the next slot in this leader window by one slot period.
+fn advance_slot_ideal_start(slot_ideal_start: &mut Instant, ns_per_slot: u128) {
+    *slot_ideal_start = slot_ideal_start
+        .checked_add(Duration::from_nanos_u128(ns_per_slot))
+        .unwrap_or(*slot_ideal_start);
+}
+
+/// Returns the time remaining until `deadline`.
+fn time_until_deadline(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+/// Milliseconds from `slot_ideal_start` to `now`. Positive if production started late (handoff
+/// delay is subtracted from the slot budget vs lagged behavior). Negative if ahead of ideal.
+fn ideal_slot_timing_delta_ms(slot_ideal_start: Instant, now: Instant) -> i64 {
+    if let Some(late_by) = now.checked_duration_since(slot_ideal_start) {
+        i64::try_from(late_by.as_millis()).unwrap_or(i64::MAX)
+    } else if let Some(early_by) = slot_ideal_start.checked_duration_since(now) {
+        -i64::try_from(early_by.as_millis()).unwrap_or(i64::MIN)
+    } else {
+        0
+    }
+}
+
+/// Log how ideal-slot anchoring adjusts this slot relative to lagged (wall-clock) behavior.
+fn log_cavey_ideal_slot_timing(
+    my_pubkey: &Pubkey,
+    slot: Slot,
+    slot_ideal_start: Instant,
+    ns_per_slot: u128,
+) {
+    let now = Instant::now();
+    let deadline = slot_deadline(slot_ideal_start, ns_per_slot);
+    let delta_ms = ideal_slot_timing_delta_ms(slot_ideal_start, now);
+    let ns_per_slot_ms = Duration::from_nanos_u128(ns_per_slot).as_millis();
+    let production_budget_ms = time_until_deadline(deadline).as_millis();
+    let lagged_budget_ms = ns_per_slot_ms;
+
+    info!(
+        "CAVEY DEBUG: {my_pubkey} leader slot {slot} ideal_slot_timing_delta_ms={delta_ms} \
+         (positive=subtracted from production budget vs lagged, negative=extra slack before \
+         deadline) production_budget_ms={production_budget_ms} lagged_budget_ms={lagged_budget_ms} \
+         ns_per_slot_ms={ns_per_slot_ms}",
+    );
 }
 
 /// Select the freshest leader-window notification within one source.
@@ -503,29 +555,32 @@ fn produce_block_footer(
     notar_reward_cert: Option<NotarRewardCertificate>,
     highest_finalized: Option<&ValidatedBlockFinalizationCert>,
 ) -> BlockFooterV1 {
-    let mut block_producer_time_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Misconfigured system clock; couldn't measure block producer time.")
-        .as_nanos() as i64;
-
     let slot = bank.slot();
 
-    if let Some(parent_bank) = bank.parent() {
-        // Get parent time from alpenglow clock (nanoseconds) or fall back to clock sysvar (seconds -> nanoseconds)
-        let parent_time_nanos = bank
+    let block_producer_time_nanos = if let Some(parent_bank) = bank.parent() {
+        let parent_time_nanos = parent_bank
             .get_nanosecond_clock()
-            .unwrap_or_else(|| bank.clock().unix_timestamp.saturating_mul(1_000_000_000));
+            .unwrap_or_else(|| parent_bank.clock().unix_timestamp.saturating_mul(1_000_000_000));
         let parent_slot = parent_bank.slot();
         let ns_per_slot = u64::try_from(bank.ns_per_slot_at_slot(slot)).unwrap_or(u64::MAX);
 
-        block_producer_time_nanos = skew_block_producer_time_nanos(
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Misconfigured system clock; couldn't measure block producer time.")
+            .as_nanos() as i64;
+        skew_block_producer_time_nanos(
             parent_slot,
             parent_time_nanos,
             slot,
-            block_producer_time_nanos,
+            now_nanos,
             ns_per_slot,
-        );
-    }
+        )
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Misconfigured system clock; couldn't measure block producer time.")
+            .as_nanos() as i64
+    };
 
     // Convert finalization certs into block marker
     let final_cert = highest_finalized.map(ValidatedBlockFinalizationCert::to_final_certificate);
@@ -541,7 +596,7 @@ fn produce_block_footer(
 }
 
 /// Produces the leader window from `start_slot` -> `end_slot` using parent
-/// `parent_slot` while abiding to the `block_timer`
+/// `parent_slot` while abiding to per-slot ideal deadlines.
 fn produce_window(
     fast_leader_handover: bool,
     start_slot: Slot,
@@ -549,14 +604,19 @@ fn produce_window(
     parent_slot: Slot,
     parent_hash: Hash,
     mut block_timer: Instant,
+    ideal_window_start: Instant,
     ctx: &mut LeaderContext,
 ) -> Result<(), StartLeaderError> {
+    // ParentReady anchors the first slot of the window; each subsequent slot steps the ideal
+    // start forward by one slot period so handoff delay is not added on top of the target.
+    let mut slot_ideal_start = ideal_window_start;
+
     // Insert the first bank
     let mut working_bank = start_leader_wait_for_parent_replay(
         start_slot,
         parent_slot,
         Some(parent_hash),
-        block_timer,
+        slot_ideal_start,
         ctx,
     )?;
     if fast_leader_handover {
@@ -568,18 +628,24 @@ fn produce_window(
     let mut slot = start_slot;
 
     while !ctx.exit.load(Ordering::Relaxed) && slot <= end_slot {
-        let timeout = block_timeout(&working_bank, slot);
+        let ns_per_slot = working_bank.ns_per_slot_at_slot(slot);
+        let deadline = slot_deadline(slot_ideal_start, ns_per_slot);
         trace!(
             "{my_pubkey}: waiting for leader bank {slot} to finish, remaining time: {}ms",
-            timeout.saturating_sub(block_timer.elapsed()).as_millis()
+            time_until_deadline(deadline).as_millis()
         );
 
         let mut bank_completion_measure = Measure::start("bank_completion");
         let optimistic_parent =
             (fast_leader_handover && slot == start_slot).then_some((parent_slot, parent_hash));
-        if let Err(e) =
-            record_and_complete_block(ctx, slot, optimistic_parent, &mut block_timer, timeout)
-        {
+        if let Err(e) = record_and_complete_block(
+            ctx,
+            slot,
+            optimistic_parent,
+            deadline,
+            &mut slot_ideal_start,
+            &mut block_timer,
+        ) {
             if ctx.exit.load(Ordering::Relaxed) {
                 return Ok(());
             }
@@ -605,9 +671,12 @@ fn produce_window(
             break;
         }
 
+        advance_slot_ideal_start(&mut slot_ideal_start, ns_per_slot);
+
         // Although `slot - 1`has been cleared from `poh_recorder`, it might not have finished processing in
         // `replay_stage`, which is why we use `start_leader_retry_replay`
-        working_bank = start_leader_wait_for_parent_replay(slot, slot - 1, None, block_timer, ctx)?;
+        working_bank =
+            start_leader_wait_for_parent_replay(slot, slot - 1, None, slot_ideal_start, ctx)?;
     }
 
     window_production_start.stop();
@@ -626,8 +695,9 @@ fn record_and_complete_block(
     ctx: &mut LeaderContext,
     bank_slot: Slot,
     mut optimistic_parent: Option<(Slot, Hash)>,
+    deadline: Instant,
+    slot_ideal_start: &mut Instant,
     block_timer: &mut Instant,
-    block_timeout: Duration,
 ) -> Result<(), PohRecorderError> {
     drain_stale_reward_certs(ctx, bank_slot);
     ctx.build_reward_certs_sender
@@ -646,7 +716,7 @@ fn record_and_complete_block(
         }
 
         // Don't timeout until we've received ParentReady.
-        let block_time_left = time_left(*block_timer, block_timeout);
+        let block_time_left = time_until_deadline(deadline);
         let select_timeout = if block_time_left.is_zero() {
             if optimistic_parent.is_none() {
                 // Happy path. We've reached the block timeout and have received
@@ -682,6 +752,7 @@ fn record_and_complete_block(
                     &mut optimistic_parent,
                     &mut accumulated_txs,
                     block_timer,
+                    slot_ideal_start,
                     &mut records_shutdown,
                 )? {
                     break true;
@@ -750,16 +821,21 @@ fn record_and_complete_block(
     // will properly increment the tick_height to max_tick_height.
     bank.set_tick_height(max_tick_height - 1);
 
-    let footer = {
-        let reward_certs = recv_reward_certs(ctx, bank_slot)?;
-        let BuildRewardCertsRespSucc {
-            skip,
-            notar,
-            validators: _,
-        } = reward_certs;
-        let reward_cert = ValidatedRewardCert::try_new(&bank, &skip, &notar)?;
-        let guard = ctx.highest_finalized.read().unwrap();
-        let footer = produce_block_footer(&bank, skip, notar, guard.as_ref());
+        let footer = {
+            let reward_certs = recv_reward_certs(ctx, bank_slot)?;
+            let BuildRewardCertsRespSucc {
+                skip,
+                notar,
+                validators: _,
+            } = reward_certs;
+            let reward_cert = ValidatedRewardCert::try_new(&bank, &skip, &notar)?;
+            let guard = ctx.highest_finalized.read().unwrap();
+            let footer = produce_block_footer(
+                &bank,
+                skip,
+                notar,
+                guard.as_ref(),
+            );
         let final_cert_input = guard.as_ref().map(|c| c.vote_rewards_input());
 
         BlockComponentProcessor::update_bank_with_footer_fields(
@@ -791,6 +867,7 @@ fn process_parent_ready(
     optimistic_parent: &mut Option<(Slot, Hash)>,
     accumulated_txs: &mut Vec<VersionedTransaction>,
     block_timer: &mut Instant,
+    slot_ideal_start: &mut Instant,
     records_shutdown: &mut bool,
 ) -> Result<bool, PohRecorderError> {
     if info.start_slot > bank_slot {
@@ -807,6 +884,7 @@ fn process_parent_ready(
                 optimistic_parent_block,
                 std::mem::take(accumulated_txs),
                 block_timer,
+                slot_ideal_start,
             )?
             .is_some()
             {
@@ -927,6 +1005,7 @@ fn handle_parent_ready(
     optimistic_parent_block: (Slot, Hash),
     mut accumulated_txs: Vec<VersionedTransaction>,
     block_timer: &mut Instant,
+    slot_ideal_start: &mut Instant,
 ) -> Result<Option<Arc<Bank>>, PohRecorderError> {
     if leader_window_info.parent_block == optimistic_parent_block {
         // Happy path: optimistic parent matches the one from ParentReady
@@ -943,6 +1022,7 @@ fn handle_parent_ready(
     // If the optimistic parent doesn't match the one specified in ParentReady, then
     // this resets the block timer to the new parent's timer.
     *block_timer = leader_window_info.block_timer;
+    *slot_ideal_start = leader_window_info.ideal_window_start;
 
     // Important: We must shutdown and drain the record receiver BEFORE sending the UpdateParent
     // marker. Otherwise, we could end up sending records for the old bank after the UpdateParent,
@@ -978,7 +1058,7 @@ fn handle_parent_ready(
         slot,
         new_parent_slot,
         Some(new_parent_hash),
-        *block_timer,
+        *slot_ideal_start,
         ctx,
     )
     .map_err(|_| PohRecorderError::ResetBankError(old_parent_slot, new_parent_slot))?;
@@ -1046,18 +1126,13 @@ fn shutdown_and_drain_record_receiver(
     Ok(())
 }
 
-/// Returns the time remaining until timeout.
-fn time_left(block_timer: Instant, timeout: Duration) -> Duration {
-    timeout.saturating_sub(block_timer.elapsed())
-}
-
 /// Similar to `maybe_start_leader`, however if replay of the parent block is lagging we retry
-/// until either replay finishes or we hit the block timeout.
+/// until either replay finishes or we hit the block deadline.
 fn start_leader_wait_for_parent_replay(
     slot: Slot,
     parent_slot: Slot,
     parent_hash: Option<Hash>,
-    block_timer: Instant,
+    slot_ideal_start: Instant,
     ctx: &mut LeaderContext,
 ) -> Result<Arc<Bank>, StartLeaderError> {
     trace!(
@@ -1065,11 +1140,17 @@ fn start_leader_wait_for_parent_replay(
         ctx.my_pubkey
     );
     let my_pubkey = ctx.my_pubkey;
-    let timeout = block_timeout(&ctx.bank_forks.read().unwrap().root_bank(), slot);
+    let ns_per_slot = ctx
+        .bank_forks
+        .read()
+        .unwrap()
+        .root_bank()
+        .ns_per_slot_at_slot(slot);
+    let deadline = slot_deadline(slot_ideal_start, ns_per_slot);
     let end_slot = last_of_consecutive_leader_slots(slot);
 
     let mut slot_delay_start = Measure::start("slot_delay");
-    while !time_left(block_timer, timeout).is_zero() {
+    while !time_until_deadline(deadline).is_zero() {
         ctx.slot_metrics.attempt_start_leader_count += 1;
 
         // Check if the entire window is skipped.
@@ -1101,6 +1182,7 @@ fn start_leader_wait_for_parent_replay(
                     });
 
                 ctx.slot_metrics.report();
+                log_cavey_ideal_slot_timing(&my_pubkey, slot, slot_ideal_start, ns_per_slot);
                 return Ok(ctx
                     .poh_recorder
                     .read()
@@ -1111,8 +1193,8 @@ fn start_leader_wait_for_parent_replay(
             Err(StartLeaderError::ReplayIsBehind(_, _)) => {
                 trace!(
                     "{my_pubkey}: Attempting to produce slot {slot}, however replay of the parent \
-                     {parent_slot} is not yet finished, waiting. Block timer {}",
-                    block_timer.elapsed().as_millis()
+                     {parent_slot} is not yet finished, waiting. Remaining deadline {}ms",
+                    time_until_deadline(deadline).as_millis()
                 );
                 let highest_frozen_slot = ctx
                     .replay_highest_frozen
@@ -1123,7 +1205,7 @@ fn start_leader_wait_for_parent_replay(
                 // We wait until either we finish replay of the parent or the block timer finishes
                 let mut wait_start = Measure::start("replay_is_behind");
                 let _unused = {
-                    let timeout = time_left(block_timer, timeout);
+                    let timeout = time_until_deadline(deadline);
                     ctx.replay_highest_frozen
                         .freeze_notification
                         .wait_timeout_while(highest_frozen_slot, timeout, |hfs| *hfs < parent_slot)
@@ -1150,7 +1232,7 @@ fn start_leader_wait_for_parent_replay(
                      has block id {actual:?}, expected {expected}; waiting for bank switch"
                 );
                 let mut wait_start = Measure::start("parent_block_id_mismatch");
-                let wait_timeout = time_left(block_timer, timeout).min(Duration::from_millis(100));
+                let wait_timeout = time_until_deadline(deadline).min(Duration::from_millis(100));
                 if !wait_timeout.is_zero() {
                     let highest_frozen_slot = ctx
                         .replay_highest_frozen
@@ -1445,12 +1527,45 @@ mod tests {
     }
 
     fn leader_window_info(start_slot: Slot, parent_slot: Slot) -> LeaderWindowInfo {
-        LeaderWindowInfo {
+        LeaderWindowInfo::new(
             start_slot,
-            end_slot: last_of_consecutive_leader_slots(start_slot),
-            parent_block: (parent_slot, Hash::new_unique()),
-            block_timer: Instant::now(),
-        }
+            last_of_consecutive_leader_slots(start_slot),
+            (parent_slot, Hash::new_unique()),
+        )
+    }
+
+    #[test]
+    fn test_ideal_slot_timing_delta_ms() {
+        let ideal = Instant::now();
+        assert_eq!(ideal_slot_timing_delta_ms(ideal, ideal), 0);
+        assert!(ideal_slot_timing_delta_ms(ideal, ideal + Duration::from_millis(50)) > 0);
+        assert!(ideal_slot_timing_delta_ms(ideal, ideal.checked_sub(Duration::from_millis(50)).unwrap()) < 0);
+    }
+
+    #[test]
+    fn test_slot_deadline_steps_from_ideal_start() {
+        let slot_ideal_start = Instant::now();
+        let ns_per_slot = 400_000_000u128;
+
+        let slot0_deadline = slot_deadline(slot_ideal_start, ns_per_slot);
+        assert_eq!(
+            slot0_deadline,
+            slot_ideal_start + Duration::from_nanos(400_000_000)
+        );
+
+        let mut next_slot_ideal_start = slot_ideal_start;
+        advance_slot_ideal_start(&mut next_slot_ideal_start, ns_per_slot);
+        let slot1_deadline = slot_deadline(next_slot_ideal_start, ns_per_slot);
+        assert_eq!(
+            slot1_deadline,
+            slot_ideal_start + Duration::from_nanos(800_000_000)
+        );
+
+        // Slot 1 deadline is one slot period from its own ideal start, not from handoff time.
+        assert!(
+            slot1_deadline
+                > slot_ideal_start + Duration::from_nanos(400_000_000) + Duration::from_millis(50)
+        );
     }
 
     #[test]
@@ -1802,8 +1917,16 @@ mod tests {
         });
 
         let start = Instant::now();
-        let result =
-            record_and_complete_block(&mut ctx, 1, None, &mut Instant::now(), Duration::ZERO);
+        let mut block_timer = Instant::now();
+        let mut slot_ideal_start = Instant::now();
+        let result = record_and_complete_block(
+            &mut ctx,
+            1,
+            None,
+            Instant::now(),
+            &mut slot_ideal_start,
+            &mut block_timer,
+        );
         assert!(matches!(result, Err(PohRecorderError::WindowMovedOn(1))));
         assert!(start.elapsed() < Duration::from_millis(250));
         assert!(!ctx.poh_recorder.read().unwrap().has_bank());
@@ -1919,18 +2042,19 @@ mod tests {
             ))
             .unwrap();
 
-        let parent_ready = LeaderWindowInfo {
-            start_slot: leader_slot,
-            end_slot: 7,
-            parent_block: (new_parent_slot, new_parent_hash),
-            block_timer: Instant::now(),
-        };
+        let parent_ready = LeaderWindowInfo::new(
+            leader_slot,
+            7,
+            (new_parent_slot, new_parent_hash),
+        );
+        let mut slot_ideal_start = parent_ready.ideal_window_start;
         let new_bank = handle_parent_ready(
             &mut ctx,
             parent_ready,
             (optimistic_parent_slot, optimistic_parent_hash),
             vec![accumulated_tx.clone()],
             &mut Instant::now(),
+            &mut slot_ideal_start,
         )
         .unwrap()
         .expect("sad handover should recreate the leader bank");

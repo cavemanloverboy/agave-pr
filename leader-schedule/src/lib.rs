@@ -17,7 +17,7 @@ pub use vote_keyed::LeaderSchedule;
 
 /// Number of consecutive slots assigned to the same leader before the schedule
 /// advances to the next validator.
-pub const NUM_CONSECUTIVE_LEADER_SLOTS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+pub const NUM_CONSECUTIVE_LEADER_SLOTS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct SlotLeader {

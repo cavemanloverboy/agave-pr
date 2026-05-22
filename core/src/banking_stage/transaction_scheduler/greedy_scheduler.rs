@@ -18,7 +18,7 @@ use {
     },
     crossbeam_channel::{Receiver, Sender},
     solana_cost_model::block_cost_limits::MAX_BLOCK_UNITS,
-    solana_ledger::shred::get_data_shred_bytes_per_batch_typical,
+    solana_ledger::shred::get_chained_merkle_fec_set_capacity_no_retransmit,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     std::num::Saturating,
 };
@@ -27,7 +27,7 @@ use {
 // maximum padding in a batch is 15%. 15% is also chosen because it is close to the
 // maximum transaction size (4096 / ~13% batch size).
 const DEFAULT_TARGET_ENTRY_BYTES_PER_BATCH: u64 =
-    get_data_shred_bytes_per_batch_typical() * 15 / 100;
+    get_chained_merkle_fec_set_capacity_no_retransmit() * 15 / 100;
 
 pub(crate) struct GreedySchedulerConfig {
     pub target_scheduled_cus: u64,

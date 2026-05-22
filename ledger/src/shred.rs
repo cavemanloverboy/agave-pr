@@ -131,12 +131,23 @@ pub const MAX_CODE_SHREDS_PER_SLOT: usize = DEFAULT_MAX_CODE_SHREDS_PER_SLOT as 
 pub const MAX_FEC_SETS_PER_SLOT: u32 =
     MAX_DATA_SHREDS_PER_SLOT as u32 / DATA_SHREDS_PER_FEC_BLOCK as u32;
 
-// Statically compute the typical data batch size assuming:
+// Statically compute the FEC set size:
 // 1. 32:32 erasure coding batch
 // 2. Merkles are chained
 // 3. No retransmit signature (only included for last batch)
-pub const fn get_data_shred_bytes_per_batch_typical() -> u64 {
+pub const fn get_chained_merkle_fec_set_capacity_no_retransmit() -> u64 {
     let capacity = match merkle::ShredData::const_capacity(PROOF_ENTRIES_FOR_32_32_BATCH, false) {
+        Ok(v) => v,
+        Err(_proof_size) => {
+            panic!("this is unreachable");
+        }
+    };
+    (DATA_SHREDS_PER_FEC_BLOCK * capacity) as u64
+}
+
+// Last FEC set in a slot reserves space for retransmitter signatures (`resigned: true`).
+pub const fn get_chained_merkle_fec_set_capacity_retransmit_signed() -> u64 {
+    let capacity = match merkle::ShredData::const_capacity(PROOF_ENTRIES_FOR_32_32_BATCH, true) {
         Ok(v) => v,
         Err(_proof_size) => {
             panic!("this is unreachable");

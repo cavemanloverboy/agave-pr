@@ -31,7 +31,7 @@ use {
 };
 
 /// Consumer will create chunks of transactions from buffer with up to this size.
-pub const TARGET_NUM_TRANSACTIONS_PER_BATCH: usize = 64;
+pub const TARGET_NUM_TRANSACTIONS_PER_BATCH: usize = 4;
 
 pub(crate) const ENTRY_OVERHEAD_BYTES: u64 = 48;
 

@@ -463,18 +463,20 @@ pub enum BroadcastSocket<'a> {
     Xdp(&'a XdpSender),
 }
 
-/// Returns the pubkey of the next leader after `slot`, or None if it is us.
+/// Returns the pubkey of the leader `leader_window_offset` windows after `slot`, or None if it is us.
 fn next_broadcast_leader_pubkey(
     leader_schedule_cache: &LeaderScheduleCache,
     working_bank: &solana_runtime::bank::Bank,
     my_pubkey: &Pubkey,
     slot: Slot,
+    leader_window_offset: u64,
 ) -> Option<Pubkey> {
-    let next_leader_slot = slot.saturating_add(NUM_CONSECUTIVE_LEADER_SLOTS);
+    let leader_slot =
+        slot.saturating_add(NUM_CONSECUTIVE_LEADER_SLOTS.saturating_mul(leader_window_offset));
     leader_schedule_cache
-        .slot_leader_at(next_leader_slot, Some(working_bank))
-        .map(|next_leader| next_leader.id)
-        .filter(|next_leader_id| next_leader_id != my_pubkey)
+        .slot_leader_at(leader_slot, Some(working_bank))
+        .map(|leader| leader.id)
+        .filter(|leader_id| leader_id != my_pubkey)
 }
 
 /// Broadcasts shreds from the leader (i.e. this node) to the root of the
@@ -498,9 +500,22 @@ pub fn broadcast_shreds(
         (bank_forks.root_bank(), bank_forks.working_bank())
     };
     let my_pubkey = cluster_info.id();
-    // Helper to find the next leader's pubkey (None if it is us)
-    let find_next_leader = |slot: Slot| -> Option<Pubkey> {
-        next_broadcast_leader_pubkey(leader_schedule_cache, &working_bank, &my_pubkey, slot)
+    let leader_udp_addr = |slot: Slot, leader_window_offset: u64| -> Option<SocketAddr> {
+        next_broadcast_leader_pubkey(
+            leader_schedule_cache,
+            &working_bank,
+            &my_pubkey,
+            slot,
+            leader_window_offset,
+        )
+        .and_then(|leader| {
+            cluster_info
+                .lookup_contact_info(&leader, |node| {
+                    node.tvu(Protocol::UDP)
+                        .filter(|addr| !addr.is_ipv6() && socket_addr_space.check(addr))
+                })
+                .flatten()
+        })
     };
 
     let packets: Vec<_> = shreds
@@ -511,24 +526,25 @@ pub fn broadcast_shreds(
             let cluster_nodes =
                 cluster_nodes_cache.get(slot, &root_bank, &working_bank, cluster_info);
             update_peer_stats(&cluster_nodes, last_datapoint_submit);
-            let maybe_next_leader_udp = find_next_leader(slot).and_then(|leader| {
-                cluster_info
-                    .lookup_contact_info(&leader, |node| {
-                        node.tvu(Protocol::UDP)
-                            .filter(|addr| !addr.is_ipv6() && socket_addr_space.check(addr))
-                    })
-                    .flatten()
-            });
+            let maybe_next_leader_udp = leader_udp_addr(slot, 1);
+            let maybe_next_next_leader_udp = leader_udp_addr(slot, 2);
             shreds.flat_map(move |shred| {
                 let key = shred.id();
                 let maybe_standard_broadcast_peer = cluster_nodes
                     .get_broadcast_peer(&key)
                     .and_then(|ci| ci.tvu(Protocol::UDP))
                     .filter(|addr| !addr.is_ipv6() && socket_addr_space.check(addr));
-                // only send to next leader if not standard broadcast peer
+                // only send to next/next-next leader if not standard broadcast peer
                 let maybe_next_leader = maybe_next_leader_udp
                     .filter(|addr| Some(*addr) != maybe_standard_broadcast_peer);
-                [maybe_next_leader, maybe_standard_broadcast_peer]
+                let maybe_next_next_leader = maybe_next_next_leader_udp
+                    .filter(|addr| Some(*addr) != maybe_standard_broadcast_peer)
+                    .filter(|addr| Some(*addr) != maybe_next_leader);
+                [
+                    maybe_next_leader,
+                    maybe_next_next_leader,
+                    maybe_standard_broadcast_peer,
+                ]
                     .into_iter()
                     .filter_map(move |tvu_addr: Option<SocketAddr>| {
                         tvu_addr.map(|addr| (shred.payload(), addr))
@@ -711,8 +727,24 @@ pub mod test {
         );
 
         assert_eq!(
-            next_broadcast_leader_pubkey(&leader_schedule_cache, &bank, &leader_a.pubkey(), 0,),
+            next_broadcast_leader_pubkey(
+                &leader_schedule_cache,
+                &bank,
+                &leader_a.pubkey(),
+                0,
+                1,
+            ),
             Some(leader_b.pubkey())
+        );
+        assert_eq!(
+            next_broadcast_leader_pubkey(
+                &leader_schedule_cache,
+                &bank,
+                &leader_a.pubkey(),
+                0,
+                2,
+            ),
+            None, // next-next leader window is also leader_a
         );
         assert_eq!(
             next_broadcast_leader_pubkey(
@@ -720,6 +752,7 @@ pub mod test {
                 &bank,
                 &leader_b.pubkey(),
                 NUM_CONSECUTIVE_LEADER_SLOTS,
+                1,
             ),
             Some(leader_a.pubkey())
         );
@@ -729,6 +762,7 @@ pub mod test {
                 &bank,
                 &leader_a.pubkey(),
                 NUM_CONSECUTIVE_LEADER_SLOTS,
+                1,
             ),
             None,
         );

@@ -193,6 +193,14 @@ impl PohRecorderMetrics {
     }
 }
 
+/// A `reset()` request that arrived while a working bank was still actively
+/// producing under `--delay-leader-block-for-pending-fork`. Stashed so the
+/// leader can complete its in-flight slot before switching to the new fork.
+struct PendingReset {
+    reset_bank: Arc<Bank>,
+    next_leader_slot: Option<(Slot, Slot)>,
+}
+
 pub struct PohRecorder {
     pub(crate) poh: Arc<Mutex<Poh>>,
     clear_bank_signal: Option<Sender<bool>>,
@@ -214,6 +222,10 @@ pub struct PohRecorder {
     metrics: PohRecorderMetrics,
     delay_leader_block_for_pending_fork: bool,
     last_reported_slot_for_pending_fork: Arc<Mutex<Slot>>,
+    /// Set when `reset()` is called mid-production with the pending-fork flag
+    /// enabled. Drained when the active working bank completes naturally
+    /// (reaches `max_tick_height`). Only the most recent reset is retained.
+    pending_reset: Option<PendingReset>,
     pub is_exited: Arc<AtomicBool>,
 
     // Allocation to hold PohEntrys recorded into PoHStream.
@@ -303,6 +315,7 @@ impl PohRecorder {
                 metrics: PohRecorderMetrics::default(),
                 delay_leader_block_for_pending_fork,
                 last_reported_slot_for_pending_fork: Arc::default(),
+                pending_reset: None,
                 is_exited,
                 entries: Vec::with_capacity(64),
                 alpenglow_enabled: false,
@@ -313,6 +326,71 @@ impl PohRecorder {
 
     // synchronize PoH with a bank
     pub fn reset(&mut self, reset_bank: Arc<Bank>, next_leader_slot: Option<(Slot, Slot)>) {
+        if self.should_defer_reset() {
+            let current_slot = self
+                .working_bank
+                .as_ref()
+                .map(|wb| wb.bank.slot())
+                .unwrap_or_default();
+            let prev_pending = self.pending_reset.as_ref().map(|p| p.reset_bank.slot());
+            datapoint_info!(
+                "poh_recorder-deferred_reset",
+                ("current_working_slot", current_slot, i64),
+                ("reset_target_slot", reset_bank.slot(), i64),
+                ("previous_pending_slot", prev_pending, Option<i64>),
+            );
+            self.pending_reset = Some(PendingReset {
+                reset_bank,
+                next_leader_slot,
+            });
+            return;
+        }
+        self.do_reset(reset_bank, next_leader_slot);
+    }
+
+    /// Whether `reset()` should defer to let the active working bank reach
+    /// `max_tick_height` before switching. Only engaged under
+    /// `--delay-leader-block-for-pending-fork`; with the flag off, behavior is
+    /// identical to the legacy reset path.
+    fn should_defer_reset(&self) -> bool {
+        if !self.delay_leader_block_for_pending_fork {
+            return false;
+        }
+        if self.alpenglow_enabled {
+            return false;
+        }
+        if self.is_exited.load(Ordering::Relaxed) {
+            return false;
+        }
+        let Some(working_bank) = self.working_bank.as_ref() else {
+            return false;
+        };
+        self.tick_height() < working_bank.max_tick_height
+    }
+
+    /// Drain and apply any deferred reset. Call only after a working bank has
+    /// completed naturally (e.g. `flush_cache` cleared it at `max_tick_height`).
+    fn apply_pending_reset(&mut self) {
+        if let Some(PendingReset {
+            reset_bank,
+            next_leader_slot,
+        }) = self.pending_reset.take()
+        {
+            info!(
+                "applying deferred reset: target slot {} next_leader_slot {:?}",
+                reset_bank.slot(),
+                next_leader_slot
+            );
+            self.do_reset(reset_bank, next_leader_slot);
+        }
+    }
+
+    /// The unconditional reset path. Callers go through `reset()` so the
+    /// pending-fork flag can defer; this is also invoked from
+    /// `apply_pending_reset()` once it is safe to switch.
+    fn do_reset(&mut self, reset_bank: Arc<Bank>, next_leader_slot: Option<(Slot, Slot)>) {
+        // Any previously-deferred reset is superseded by this one.
+        self.pending_reset = None;
         self.clear_bank(false);
         let tick_height = self.reset_poh(reset_bank, true);
 
@@ -712,6 +790,10 @@ impl PohRecorder {
             }
         }
         if send_result.is_ok() {
+            // Commit the flush BEFORE possibly applying a pending reset.
+            // `apply_pending_reset` → `do_reset` → `reset_poh` clears
+            // `tick_cache`, which would invalidate the `entry_count` index.
+            let _ = self.tick_cache.drain(..entry_count);
             if self.tick_height() >= working_bank.max_tick_height {
                 info!(
                     "poh_record: max_tick_height {} reached, clearing working_bank {}",
@@ -722,9 +804,12 @@ impl PohRecorder {
                 let working_slot = self.start_slot();
                 self.start_tick_height = working_slot * self.ticks_per_slot + 1;
                 self.clear_bank(true);
+                // The working bank reached its natural end. If a reset() was
+                // deferred while we were producing (pending-fork flag path),
+                // apply it now so the next slot's leader scheduling starts
+                // from the most recent target.
+                self.apply_pending_reset();
             }
-            // commit the flush
-            let _ = self.tick_cache.drain(..entry_count);
         } else {
             info!("WorkingBank::sender disconnected or footer failed {send_result:?}");
             // Alpenglow block completion errors must leave the bank attached so
@@ -2003,6 +2088,165 @@ mod tests {
         assert_eq!(bank.slot(), 0);
         poh_recorder.reset(bank, Some((4, 4)));
         assert!(poh_recorder.working_bank.is_none());
+    }
+
+    /// Helper for the pending-reset tests: builds a PohRecorder seeded on a
+    /// freshly-created bank, with `delay_leader_block_for_pending_fork` togglable.
+    /// Returns the `working_bank_receiver` so callers can keep it alive — if it
+    /// drops, `flush_cache` errors out and never reaches the bank-clear branch.
+    #[allow(clippy::type_complexity)]
+    fn pending_reset_test_setup(
+        delay_leader_block_for_pending_fork: bool,
+    ) -> (
+        PohRecorder,
+        Receiver<WorkingBankEntryOrMarker>,
+        Arc<Bank>,
+        Arc<Bank>,
+    ) {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let (bank0, bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        let bank1 = Bank::new_from_parent_with_bank_forks(
+            bank_forks.as_ref(),
+            bank0.clone(),
+            SlotLeader::default(),
+            bank0.slot() + 1,
+        );
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
+        let (mut poh_recorder, entry_receiver) = PohRecorder::new_with_clear_signal(
+            0,
+            Hash::default(),
+            bank0.clone(),
+            Some((bank1.slot(), bank1.slot())),
+            bank0.ticks_per_slot(),
+            delay_leader_block_for_pending_fork,
+            Arc::new(blockstore),
+            None,
+            &Arc::new(LeaderScheduleCache::new_from_bank(&bank0)),
+            &PohConfig::default(),
+            Arc::new(AtomicBool::default()),
+        );
+        poh_recorder.set_bank_for_test(bank1.clone());
+        (poh_recorder, entry_receiver, bank0, bank1)
+    }
+
+    #[test]
+    fn test_pending_reset_deferred_when_producing_with_flag() {
+        let (mut poh_recorder, _entry_receiver, _bank0, bank1) = pending_reset_test_setup(true);
+        assert!(poh_recorder.working_bank.is_some());
+        assert!(poh_recorder.pending_reset.is_none());
+
+        // Reset target arrives while we're still producing on bank1 — should defer.
+        poh_recorder.reset(bank1.clone(), Some((bank1.slot() + 1, bank1.slot() + 1)));
+
+        assert!(
+            poh_recorder.working_bank.is_some(),
+            "working bank should not be cleared by deferred reset"
+        );
+        let pending = poh_recorder
+            .pending_reset
+            .as_ref()
+            .expect("reset should be deferred");
+        assert_eq!(pending.reset_bank.slot(), bank1.slot());
+        assert_eq!(pending.next_leader_slot, Some((bank1.slot() + 1, bank1.slot() + 1)));
+    }
+
+    #[test]
+    fn test_pending_reset_not_deferred_without_flag() {
+        let (mut poh_recorder, _entry_receiver, _bank0, bank1) = pending_reset_test_setup(false);
+        assert!(poh_recorder.working_bank.is_some());
+
+        // Without the flag, reset() must clear the working bank immediately and
+        // never populate pending_reset (preserves legacy behavior).
+        poh_recorder.reset(bank1.clone(), Some((bank1.slot() + 1, bank1.slot() + 1)));
+
+        assert!(poh_recorder.working_bank.is_none());
+        assert!(poh_recorder.pending_reset.is_none());
+    }
+
+    #[test]
+    fn test_pending_reset_not_deferred_when_exiting() {
+        let (mut poh_recorder, _entry_receiver, _bank0, bank1) = pending_reset_test_setup(true);
+        poh_recorder
+            .is_exited
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(poh_recorder.working_bank.is_some());
+
+        // Even with the flag on, exit must not block the reset path.
+        poh_recorder.reset(bank1.clone(), Some((bank1.slot() + 1, bank1.slot() + 1)));
+
+        assert!(poh_recorder.working_bank.is_none());
+        assert!(poh_recorder.pending_reset.is_none());
+    }
+
+    #[test]
+    fn test_pending_reset_overwritten_by_newer_reset() {
+        let (mut poh_recorder, _entry_receiver, bank0, bank1) = pending_reset_test_setup(true);
+
+        // Two resets while producing — only the most recent one survives.
+        poh_recorder.reset(bank0.clone(), Some((bank1.slot() + 1, bank1.slot() + 1)));
+        poh_recorder.reset(bank1.clone(), Some((bank1.slot() + 5, bank1.slot() + 5)));
+
+        let pending = poh_recorder
+            .pending_reset
+            .as_ref()
+            .expect("reset should still be deferred");
+        assert_eq!(pending.reset_bank.slot(), bank1.slot());
+        assert_eq!(
+            pending.next_leader_slot,
+            Some((bank1.slot() + 5, bank1.slot() + 5))
+        );
+    }
+
+    #[test]
+    fn test_pending_reset_cleared_when_direct_reset_runs() {
+        let (mut poh_recorder, _entry_receiver, bank0, bank1) = pending_reset_test_setup(true);
+
+        // First defer a reset.
+        poh_recorder.reset(bank0.clone(), Some((bank1.slot() + 1, bank1.slot() + 1)));
+        assert!(poh_recorder.pending_reset.is_some());
+
+        // Now clear the bank manually so the next reset goes through immediately
+        // instead of deferring. The stale pending_reset must be dropped on the
+        // direct reset path.
+        poh_recorder.clear_bank_for_test();
+        assert!(poh_recorder.working_bank.is_none());
+        poh_recorder.reset(bank1.clone(), Some((bank1.slot() + 2, bank1.slot() + 2)));
+        assert!(poh_recorder.pending_reset.is_none());
+    }
+
+    #[test]
+    fn test_pending_reset_applied_after_max_tick_height() {
+        let (mut poh_recorder, _entry_receiver, bank0, bank1) = pending_reset_test_setup(true);
+        let max_tick_height = poh_recorder
+            .working_bank
+            .as_ref()
+            .expect("working bank")
+            .max_tick_height;
+        assert!(max_tick_height > 0);
+
+        // Defer a reset while producing on bank1.
+        poh_recorder.reset(bank0.clone(), Some((bank1.slot() + 3, bank1.slot() + 3)));
+        assert!(poh_recorder.pending_reset.is_some());
+
+        // Tick all the way to max_tick_height. flush_cache should clear the bank
+        // and drain the pending reset.
+        while poh_recorder.tick_height() < max_tick_height {
+            poh_recorder.tick();
+        }
+
+        assert!(
+            poh_recorder.working_bank.is_none(),
+            "working bank should be cleared at max_tick_height"
+        );
+        assert!(
+            poh_recorder.pending_reset.is_none(),
+            "pending reset should be applied after slot completion"
+        );
+        // After applying the pending reset, start_bank is the reset target.
+        assert_eq!(poh_recorder.start_slot(), bank0.slot());
     }
 
     #[test]

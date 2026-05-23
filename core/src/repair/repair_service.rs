@@ -58,12 +58,12 @@ use {crate::repair::duplicate_repair_status::DuplicateSlotRepairStatus, solana_k
 // Time to defer repair requests after repair observes, or infers from a later
 // FEC, that the missing shred's FEC set has started arriving. Value was derived
 // empirically observing slot times vs. repair activity on mainnet nodes.
-const FEC_REPAIR_DELAY: Duration = Duration::from_millis(250);
+const FEC_REPAIR_DELAY: Duration = Duration::from_millis(50);
 
 // This is the amount of time we will wait for a repair request to be fulfilled
 // before making another request. Value is based on reasonable upper bound of
 // expected network delays in requesting repairs and receiving shreds.
-pub(crate) const REPAIR_REQUEST_TIMEOUT_MS: u64 = 150;
+pub(crate) const REPAIR_REQUEST_TIMEOUT_MS: u64 = 50;
 
 // When requesting repair for a specific shred through the admin RPC, we will
 // request up to NUM_PEERS_TO_SAMPLE_FOR_REPAIRS in the event a specific, valid

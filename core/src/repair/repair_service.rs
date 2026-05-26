@@ -808,7 +808,7 @@ impl RepairService {
             repairs
                 .into_iter()
                 .filter_map(|repair_request| {
-                    let (to, req) = serve_repair
+                    serve_repair
                         .repair_request(
                             repair_info,
                             repair_request,
@@ -816,9 +816,11 @@ impl RepairService {
                             &mut repair_metrics.stats,
                             &mut outstanding_requests,
                         )
-                        .ok()??;
-                    Some((req, to))
+                        .ok()
+                        .flatten()
                 })
+                .flatten()
+                .map(|(to, req)| (req, to))
                 .collect()
         };
         build_repairs_batch_elapsed.stop();

@@ -75,6 +75,8 @@ use {
 
 /// the number of slots to respond with when responding to `Orphan` requests
 pub const MAX_ORPHAN_REPAIR_RESPONSES: usize = 11;
+/// Default repair peers per shred request (tests / non-imminent baseline).
+pub(crate) const REPAIR_REQUEST_PEER_COUNT: usize = 1;
 // Number of slots to cache their respective repair peers and sampling weights.
 pub(crate) const REPAIR_PEERS_CACHE_CAPACITY: usize = 128;
 // Limit cache entries ttl in order to avoid re-using outdated data.
@@ -677,6 +679,24 @@ impl RepairPeers {
     fn sample<R: Rng>(&self, rng: &mut R) -> &Node {
         let index = self.weighted_index.sample(rng);
         &self.peers[index]
+    }
+
+    fn sample_peers<R: Rng>(&self, rng: &mut R, count: usize) -> Vec<&Node> {
+        let count = count.min(self.peers.len());
+        if count == 0 {
+            return vec![];
+        }
+        if count == self.peers.len() {
+            return self.peers.iter().collect();
+        }
+        let mut indices = Vec::with_capacity(count);
+        while indices.len() < count {
+            let index = self.weighted_index.sample(rng);
+            if !indices.contains(&index) {
+                indices.push(index);
+            }
+        }
+        indices.iter().map(|&i| &self.peers[i]).collect()
     }
 
     fn is_valid_for(&self, weight_source: RepairPeerWeightSource) -> bool {
@@ -1615,8 +1635,9 @@ impl ServeRepair {
         repair_request: ShredRepairType,
         peers_cache: &mut LruCache<Slot, RepairPeers>,
         repair_stats: &mut RepairStats,
+        peer_count: usize,
         outstanding_requests: &mut OutstandingShredRepairs,
-    ) -> Result<Option<(SocketAddr, Vec<u8>)>> {
+    ) -> Result<Option<Vec<(SocketAddr, Vec<u8>)>>> {
         let identity_keypair = repair_info.cluster_info.keypair();
         // find a peer that appears to be accepting replication and has the desired slot, as indicated
         // by a valid tvu port location
@@ -1630,7 +1651,7 @@ impl ServeRepair {
             &identity_keypair,
             weight_source,
         )?;
-        let peer = repair_peers.sample(&mut rand::rng());
+        let peers = repair_peers.sample_peers(&mut rand::rng(), peer_count);
         let location = repair_request
             .block_id()
             // Eager repair uses the Original blockstore column,
@@ -1644,20 +1665,26 @@ impl ServeRepair {
             timestamp(),
             Some(location),
         );
-        let out = self.map_repair_request(
-            &repair_request,
-            &peer.pubkey,
-            repair_stats,
-            nonce,
-            &identity_keypair,
-        )?;
+        let mut packets = Vec::with_capacity(peers.len());
+        let mut peer_pubkeys = Vec::with_capacity(peers.len());
+        for peer in peers {
+            let out = self.map_repair_request(
+                &repair_request,
+                &peer.pubkey,
+                repair_stats,
+                nonce,
+                &identity_keypair,
+            )?;
+            peer_pubkeys.push(peer.pubkey);
+            packets.push((peer.serve_repair, out));
+        }
         debug!(
-            "Sending repair request from {} to {} for {:#?}",
+            "Sending repair request from {} to {:?} for {:#?}",
             identity_keypair.pubkey(),
-            peer.pubkey,
+            peer_pubkeys,
             repair_request
         );
-        Ok(Some((peer.serve_repair, out)))
+        Ok(Some(packets))
     }
 
     /// [`Self::repair_request`] but for [`BlockIdRepairType`] requests
@@ -2580,6 +2607,7 @@ mod tests {
             ShredRepairType::Shred(0, 0),
             &mut LruCache::new(100),
             &mut RepairStats::default(),
+            REPAIR_REQUEST_PEER_COUNT,
             &mut outstanding_requests,
         );
         assert_matches!(rv, Err(Error::ClusterInfo(ClusterInfoError::NoPeers)));
@@ -2604,12 +2632,14 @@ mod tests {
                 ShredRepairType::Shred(0, 0),
                 &mut LruCache::new(100),
                 &mut RepairStats::default(),
+                REPAIR_REQUEST_PEER_COUNT,
                 &mut outstanding_requests,
             )
             .unwrap()
             .unwrap();
         assert_eq!(nxt.serve_repair(Protocol::UDP).unwrap(), serve_repair_addr);
-        assert_eq!(rv.0, nxt.serve_repair(Protocol::UDP).unwrap());
+        assert_eq!(rv.len(), 1);
+        assert_eq!(rv[0].0, nxt.serve_repair(Protocol::UDP).unwrap());
 
         let serve_repair_addr2 = socketaddr!([127, 0, 0, 2], 1243);
         let mut nxt = ContactInfo::new(
@@ -2625,28 +2655,36 @@ mod tests {
         nxt.set_serve_repair(Protocol::UDP, serve_repair_addr2)
             .unwrap();
         cluster_info.insert_info(nxt);
-        let mut one = false;
-        let mut two = false;
-        while !one || !two {
-            //this randomly picks an option, so eventually it should pick both
-            let rv = serve_repair
-                .repair_request(
-                    &repair_info,
-                    ShredRepairType::Shred(0, 0),
-                    &mut LruCache::new(100),
-                    &mut RepairStats::default(),
-                    &mut outstanding_requests,
-                )
-                .unwrap()
-                .unwrap();
-            if rv.0 == serve_repair_addr {
-                one = true;
-            }
-            if rv.0 == serve_repair_addr2 {
-                two = true;
-            }
-        }
-        assert!(one && two);
+        let rv = serve_repair
+            .repair_request(
+                &repair_info,
+                ShredRepairType::Shred(0, 0),
+                &mut LruCache::new(100),
+                &mut RepairStats::default(),
+                REPAIR_REQUEST_PEER_COUNT,
+                &mut outstanding_requests,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(rv.len(), 1);
+        let addr = rv[0].0;
+        assert!(addr == serve_repair_addr || addr == serve_repair_addr2);
+
+        let rv = serve_repair
+            .repair_request(
+                &repair_info,
+                ShredRepairType::Shred(0, 0),
+                &mut LruCache::new(100),
+                &mut RepairStats::default(),
+                3,
+                &mut outstanding_requests,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(rv.len(), 2);
+        let addrs: HashSet<_> = rv.into_iter().map(|(addr, _)| addr).collect();
+        assert!(addrs.contains(&serve_repair_addr));
+        assert!(addrs.contains(&serve_repair_addr2));
     }
 
     #[test]
@@ -2930,6 +2968,7 @@ mod tests {
                 ShredRepairType::Shred(slot, 0),
                 &mut peers_cache,
                 &mut RepairStats::default(),
+                REPAIR_REQUEST_PEER_COUNT,
                 &mut outstanding_shred_requests,
             ),
             Err(Error::WeightedIndex(WeightedError::InsufficientNonZero))
@@ -2996,6 +3035,7 @@ mod tests {
                     ShredRepairType::Shred(0, 0),
                     &mut LruCache::new(100),
                     &mut RepairStats::default(),
+                    REPAIR_REQUEST_PEER_COUNT,
                     &mut OutstandingShredRepairs::default(),
                 ),
                 Err(Error::ClusterInfo(ClusterInfoError::NoPeers))
@@ -3015,6 +3055,7 @@ mod tests {
                 ShredRepairType::Shred(0, 0),
                 &mut LruCache::new(100),
                 &mut RepairStats::default(),
+                REPAIR_REQUEST_PEER_COUNT,
                 &mut OutstandingShredRepairs::default(),
             ),
             Ok(Some(_))
@@ -3037,6 +3078,7 @@ mod tests {
                 ShredRepairType::Shred(0, 0),
                 &mut LruCache::new(100),
                 &mut RepairStats::default(),
+                REPAIR_REQUEST_PEER_COUNT,
                 &mut OutstandingShredRepairs::default(),
             ),
             Ok(Some(_))

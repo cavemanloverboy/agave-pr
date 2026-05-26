@@ -18,7 +18,7 @@ use {
         repair::{
             outstanding_requests::OutstandingRequests,
             packet_threshold::DynamicPacketToProcessThreshold,
-            repair_service::{REPAIR_MS, RepairInfo, RepairStats},
+            repair_service::{REPAIR_MS, RepairInfo, RepairStats, repair_request_peer_count},
             serve_repair::{BlockIdRepairResponse, BlockIdRepairType, RepairProtocol},
         },
         shred_fetch_stage::SHRED_FETCH_CHANNEL_SIZE,
@@ -983,13 +983,14 @@ impl BlockIdRepairService {
                     }
                 }
                 OutgoingMessage::Shred(shred_request) => {
-                    let Ok(Some((addr, bytes))) = state
+                    let Ok(Some(packets)) = state
                         .serve_repair
                         .repair_request(
                             repair_info,
                             shred_request,
                             &mut state.peers_cache,
                             &mut RepairStats::default(),
+                            repair_request_peer_count(),
                             &mut state.outstanding_shred_requests.write().unwrap(),
                         )
                         .inspect_err(|e| {
@@ -1005,7 +1006,9 @@ impl BlockIdRepairService {
                         continue;
                     };
 
-                    shred_socket_batch.push((bytes, addr));
+                    for (addr, bytes) in packets {
+                        shred_socket_batch.push((bytes, addr));
+                    }
                     state.sent_requests.insert(request, now);
 
                     // Update stats

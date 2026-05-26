@@ -108,6 +108,20 @@ fn repair_request_timeout_ms() -> u64 {
     }
 }
 
+const REPAIR_REQUEST_PEER_COUNT: usize = 1;
+const REPAIR_REQUEST_PEER_COUNT_IMMINENT: usize = 3;
+
+/// CAVEY DEBUG: returns how many distinct peers to request the same shred from.
+/// Aggressive (3) when [`ALMOST_LEADER`] is set, default (1) otherwise.
+#[inline]
+pub(crate) fn repair_request_peer_count() -> usize {
+    if ALMOST_LEADER.load(Ordering::Relaxed) {
+        REPAIR_REQUEST_PEER_COUNT_IMMINENT
+    } else {
+        REPAIR_REQUEST_PEER_COUNT
+    }
+}
+
 // When requesting repair for a specific shred through the admin RPC, we will
 // request up to NUM_PEERS_TO_SAMPLE_FOR_REPAIRS in the event a specific, valid
 // target node is not provided. This number was chosen to provide reasonable
@@ -855,17 +869,20 @@ impl RepairService {
             repairs
                 .into_iter()
                 .filter_map(|repair_request| {
-                    let (to, req) = serve_repair
+                    serve_repair
                         .repair_request(
                             repair_info,
                             repair_request,
                             peers_cache,
                             &mut repair_metrics.stats,
+                            repair_request_peer_count(),
                             &mut outstanding_requests,
                         )
-                        .ok()??;
-                    Some((req, to))
+                        .ok()
+                        .flatten()
                 })
+                .flatten()
+                .map(|(to, req)| (req, to))
                 .collect()
         };
         build_repairs_batch_elapsed.stop();

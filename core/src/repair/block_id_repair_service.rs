@@ -983,7 +983,7 @@ impl BlockIdRepairService {
                     }
                 }
                 OutgoingMessage::Shred(shred_request) => {
-                    let Ok(Some((addr, bytes))) = state
+                    let Ok(Some(packets)) = state
                         .serve_repair
                         .repair_request(
                             repair_info,
@@ -1005,7 +1005,9 @@ impl BlockIdRepairService {
                         continue;
                     };
 
-                    shred_socket_batch.push((bytes, addr));
+                    for (addr, bytes) in packets {
+                        shred_socket_batch.push((bytes, addr));
+                    }
                     state.sent_requests.insert(request, now);
 
                     // Update stats

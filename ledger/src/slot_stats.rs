@@ -49,6 +49,19 @@ impl SlotStats {
             .unwrap_or_default()
     }
 
+    /// CAVEY DEBUG: aggregate stats over the per-FEC-set turbine receive counts.
+    /// Returns (num_fec_sets_observed, total_turbine_shreds, max_per_set_count).
+    /// Together with `num_recovered` / `num_repaired` this lets us compute the
+    /// direct-receive vs. FEC-recovered ratio per slot, which is the core
+    /// turbine-health signal we want to track.
+    fn fec_set_aggregates(stats: &LocationShredStats) -> (usize, usize, usize) {
+        let counts = &stats.turbine_fec_set_index_counts;
+        let num_sets = counts.len();
+        let total: usize = counts.values().sum();
+        let max_in_any_set = counts.values().max().copied().unwrap_or_default();
+        (num_sets, total, max_in_any_set)
+    }
+
     fn location_stats(&self, location: BlockLocation) -> &LocationShredStats {
         match location {
             BlockLocation::Original => &self.original,
@@ -69,6 +82,8 @@ impl SlotStats {
 
     fn report_location(&self, slot: Slot, name: &'static str, location_stats: &LocationShredStats) {
         let min_fec_set_count = Self::min_index_count(location_stats);
+        let (num_fec_sets_observed, total_turbine_shreds, max_turbine_fec_set_count) =
+            Self::fec_set_aggregates(location_stats);
         datapoint_info!(
             name,
             ("slot", slot, i64),
@@ -76,6 +91,14 @@ impl SlotStats {
             ("num_repaired", location_stats.num_repaired, i64),
             ("num_recovered", location_stats.num_recovered, i64),
             ("min_turbine_fec_set_count", min_fec_set_count, i64),
+            // CAVEY DEBUG: turbine direct-reception breakdown
+            ("num_fec_sets_observed", num_fec_sets_observed as i64, i64),
+            ("total_turbine_shreds", total_turbine_shreds as i64, i64),
+            (
+                "max_turbine_fec_set_count",
+                max_turbine_fec_set_count as i64,
+                i64
+            ),
             ("is_full", location_stats.is_full, bool),
             ("is_rooted", self.flags.contains(SlotFlags::ROOTED), bool),
             ("is_dead", self.flags.contains(SlotFlags::DEAD), bool),

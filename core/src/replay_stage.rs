@@ -2919,6 +2919,57 @@ impl ReplayStage {
             datapoint_info!("replay_stage-my_leader_slot", ("slot", poh_slot, i64),);
             info!("new fork:{poh_slot} parent:{parent_slot} (leader) root:{root_slot}");
 
+            // CAVEY DEBUG: leader fork-view at slot-start. Records the staleness of our
+            // chosen parent vs. what we already had locally frozen at this moment, plus
+            // the alternate frozen-bank tips that we did NOT pick. Used to confirm the
+            // hypothesis that `leader_partial_first_fec` aborts come from picking a
+            // stale parent because shreds for newer slots are still in flight (or being
+            // FEC-recovered) at the moment the leader commits.
+            {
+                let bf_read = bank_forks.read().unwrap();
+                let mut max_frozen_slot: Slot = 0;
+                let mut num_frozen_above_parent: usize = 0;
+                let mut alt_frozen_slots: Vec<Slot> = Vec::with_capacity(8);
+                for (s, _bank) in bf_read.frozen_banks() {
+                    if s > max_frozen_slot {
+                        max_frozen_slot = s;
+                    }
+                    if s > parent_slot {
+                        num_frozen_above_parent += 1;
+                        if alt_frozen_slots.len() < 8 {
+                            alt_frozen_slots.push(s);
+                        }
+                    }
+                }
+                drop(bf_read);
+                let parent_lag_slots = max_frozen_slot.saturating_sub(parent_slot);
+                let our_pick_stake_pct = progress_map
+                    .get_fork_stats(parent_slot)
+                    .map(|fs| {
+                        if fs.total_stake == 0 {
+                            0.0_f64
+                        } else {
+                            (fs.fork_stake as f64) / (fs.total_stake as f64)
+                        }
+                    })
+                    .unwrap_or(0.0);
+                datapoint_info!(
+                    "replay_stage-leader_start_fork_view",
+                    ("slot", poh_slot as i64, i64),
+                    ("parent_slot", parent_slot as i64, i64),
+                    ("parent_hash", parent.hash().to_string(), String),
+                    ("max_frozen_slot", max_frozen_slot as i64, i64),
+                    ("parent_lag_slots", parent_lag_slots as i64, i64),
+                    (
+                        "num_frozen_above_parent",
+                        num_frozen_above_parent as i64,
+                        i64
+                    ),
+                    ("alt_frozen_slots", format!("{alt_frozen_slots:?}"), String),
+                    ("our_pick_fork_weight", our_pick_stake_pct, f64),
+                );
+            }
+
             let vote_only_bank = if migration_status.should_bank_be_vote_only(poh_slot) {
                 info!("{my_pubkey}: Creating block in slot {poh_slot} in VoM");
                 datapoint_info!("vote-only-bank", ("slot", poh_slot, i64));

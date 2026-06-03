@@ -352,6 +352,25 @@ impl StandardBroadcastRun {
         let maybe_send_header = if self.slot != bank.slot() {
             // Finish previous slot if it was interrupted.
             if !self.completed {
+                // CAVEY DEBUG: broadcast was producing slot `self.slot` on parent
+                // `self.parent`, but a new bank just arrived (slot=bank.slot(),
+                // parent=bank.parent_slot()). If the new bank's parent differs from
+                // the parent we were broadcasting on, this is a fork-switch abort.
+                // Record this so we can see, post-hoc, exactly when the leader's
+                // production was abandoned for a different fork.
+                let aborted_after_us = self.slot_broadcast_start.elapsed().as_micros() as i64;
+                let was_fork_switch = bank.parent_slot() != self.parent;
+                datapoint_info!(
+                    "broadcast_stage-leader_abort",
+                    ("aborted_slot", self.slot as i64, i64),
+                    ("aborted_parent_slot", self.parent as i64, i64),
+                    ("new_slot", bank.slot() as i64, i64),
+                    ("new_parent_slot", bank.parent_slot() as i64, i64),
+                    ("data_shreds_emitted", self.next_shred_index as i64, i64),
+                    ("code_shreds_emitted", self.next_code_index as i64, i64),
+                    ("aborted_after_us", aborted_after_us, i64),
+                    ("was_fork_switch", was_fork_switch, bool),
+                );
                 let shreds = self.finish_prev_slot(keypair, bank.ticks_per_slot() as u8);
                 debug_assert!(shreds.iter().all(|shred| shred.slot() == self.slot));
                 // Broadcast shreds for the interrupted slot.

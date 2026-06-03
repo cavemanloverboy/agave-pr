@@ -25,7 +25,8 @@ use {
             cluster_slot_state_verifier::*,
             duplicate_repair_status::AncestorDuplicateSlotToRepair,
             repair_service::{
-                AncestorDuplicateSlotsReceiver, DumpedSlotsSender, PopularPrunedForksReceiver,
+                ALMOST_LEADER, ALMOST_LEADER_LOOKAHEAD_SLOTS, AncestorDuplicateSlotsReceiver,
+                DumpedSlotsSender, PopularPrunedForksReceiver,
             },
         },
         unfrozen_gossip_verified_vote_hashes::UnfrozenGossipVerifiedVoteHashes,
@@ -3525,6 +3526,17 @@ impl ReplayStage {
             Some(blockstore),
             GRACE_TICKS_FACTOR * MAX_GRACE_SLOTS,
         );
+
+        // CAVEY DEBUG: flip the repair-service ALMOST_LEADER atomic so repair
+        // uses aggressive timeouts when our leader window is within
+        // ALMOST_LEADER_LOOKAHEAD_SLOTS of `slot`. This gates the lower
+        // FEC-defer + retry timeouts in repair_service.rs.
+        let almost_leader = matches!(
+            next_leader_slot,
+            Some((leader_slot, _))
+                if leader_slot.saturating_sub(slot) <= ALMOST_LEADER_LOOKAHEAD_SLOTS,
+        );
+        ALMOST_LEADER.store(almost_leader, Ordering::Relaxed);
 
         if poh_controller.reset(bank, next_leader_slot).is_err() {
             warn!("Failed to reset poh, poh service is disconnected");

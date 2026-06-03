@@ -65,6 +65,49 @@ const FEC_REPAIR_DELAY: Duration = Duration::from_millis(250);
 // expected network delays in requesting repairs and receiving shreds.
 pub(crate) const REPAIR_REQUEST_TIMEOUT_MS: u64 = 150;
 
+// CAVEY DEBUG: when our next leader slot is within 2 slots, we drop the FEC
+// observation defer window and the per-request retry timeout to this value so
+// that any in-flight gaps in our recent fork view get filled before
+// `maybe_start_leader` commits to a parent. Defaults above are tuned for
+// mainnet bandwidth/efficiency tradeoffs; on the 2x200 experimental cluster
+// the priority is fork-view freshness over repair-bandwidth thrift.
+const FEC_REPAIR_DELAY_MS_IMMINENT: u64 = 50;
+const REPAIR_REQUEST_TIMEOUT_MS_IMMINENT: u64 = 50;
+
+/// CAVEY DEBUG: set to `true` by replay-stage when our next leader slot is
+/// within `ALMOST_LEADER_LOOKAHEAD_SLOTS` of the slot whose PoH we just
+/// reset to; cleared otherwise. Read by repair eligibility checks and the
+/// outstanding-request retention to choose the aggressive timeouts above.
+pub static ALMOST_LEADER: AtomicBool = AtomicBool::new(false);
+
+/// CAVEY DEBUG: leader-window proximity threshold (in slots) for switching
+/// repair into aggressive mode. Two slots ≈ 400 ms of warning, which gives
+/// the aggressive 50 ms FEC-defer / retry timers ~8 firings before the leader
+/// commits to a parent.
+pub const ALMOST_LEADER_LOOKAHEAD_SLOTS: u64 = 2;
+
+/// CAVEY DEBUG: returns the FEC observation defer window in milliseconds.
+/// Aggressive when [`ALMOST_LEADER`] is set, conservative default otherwise.
+#[inline]
+fn fec_repair_delay_ms() -> u64 {
+    if ALMOST_LEADER.load(Ordering::Relaxed) {
+        FEC_REPAIR_DELAY_MS_IMMINENT
+    } else {
+        FEC_REPAIR_DELAY.as_millis() as u64
+    }
+}
+
+/// CAVEY DEBUG: returns the per-request retry timeout in milliseconds.
+/// Aggressive when [`ALMOST_LEADER`] is set, conservative default otherwise.
+#[inline]
+fn repair_request_timeout_ms() -> u64 {
+    if ALMOST_LEADER.load(Ordering::Relaxed) {
+        REPAIR_REQUEST_TIMEOUT_MS_IMMINENT
+    } else {
+        REPAIR_REQUEST_TIMEOUT_MS
+    }
+}
+
 // When requesting repair for a specific shred through the admin RPC, we will
 // request up to NUM_PEERS_TO_SAMPLE_FOR_REPAIRS in the event a specific, valid
 // target node is not provided. This number was chosen to provide reasonable
@@ -192,7 +235,7 @@ impl RepairEligibility {
             .get(&slot)
             .and_then(|slot_repair| slot_repair.first_shred_observed_at(shred_index))
             .map(|first_shred_time| {
-                now_ms.saturating_sub(first_shred_time) >= FEC_REPAIR_DELAY.as_millis() as u64
+                now_ms.saturating_sub(first_shred_time) >= fec_repair_delay_ms()
             })
             .unwrap_or(false)
     }
@@ -203,7 +246,7 @@ impl RepairEligibility {
     /// This path only applies while the slot's true last index is unknown. Empty
     /// slots are eligible immediately so parent-slot repair can make progress;
     /// otherwise the highest observed FEC set must have been quiet for
-    /// `FEC_REPAIR_DELAY`.
+    /// `FEC_REPAIR_DELAY` (or the imminent override; see [`fec_repair_delay_ms`]).
     pub(crate) fn is_highest_shred_eligible(
         &self,
         slot: Slot,
@@ -220,7 +263,7 @@ impl RepairEligibility {
             .get(&slot)
             .and_then(|slot_repair| slot_repair.first_observed_at_ms.last().copied())
             .map(|last_observed_fec_time| {
-                now_ms.saturating_sub(last_observed_fec_time) >= FEC_REPAIR_DELAY.as_millis() as u64
+                now_ms.saturating_sub(last_observed_fec_time) >= fec_repair_delay_ms()
             })
             .unwrap_or(false)
     }
@@ -740,8 +783,12 @@ impl RepairService {
     ) -> Vec<ShredRepairType> {
         let mut purge_outstanding_repairs = Measure::start("purge_outstanding_repairs");
         // Purge old entries. They've either completed or need to be retried.
+        // CAVEY DEBUG: when ALMOST_LEADER is set the timeout drops to
+        // REPAIR_REQUEST_TIMEOUT_MS_IMMINENT (50 ms) so unfilled requests
+        // get reissued faster while a leader window is imminent.
+        let request_timeout_ms = repair_request_timeout_ms();
         outstanding_repairs.retain(|_repair_request, time| {
-            timestamp().saturating_sub(*time) < REPAIR_REQUEST_TIMEOUT_MS
+            timestamp().saturating_sub(*time) < request_timeout_ms
         });
         purge_outstanding_repairs.stop();
         repair_metrics.timing.purge_outstanding_repairs = purge_outstanding_repairs.as_us();

@@ -389,6 +389,9 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
     }
 
     /// Returns the list of pubkeys from the secondary index for the given key.
+    ///
+    /// Collects under a short-lived index lock, then returns so callers can load
+    /// accounts without holding secondary-index locks (which would stall inserts).
     pub(crate) fn get_index_key_pubkeys(&self, index_key: &IndexKey) -> Vec<Pubkey> {
         match index_key {
             IndexKey::ProgramId(key) => self.program_id_index.get(key),

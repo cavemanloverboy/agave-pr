@@ -20,6 +20,7 @@ rustdoc-args = ["--cfg=docsrs"]
 agave-unstable-api = []
 
 [dependencies]
+agave-block-verify = { workspace = true }
 agave-cpu-utils = { workspace = true }
 agave-feature-set = { workspace = true }
 agave-logger = { workspace = true }

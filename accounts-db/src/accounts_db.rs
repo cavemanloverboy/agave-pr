@@ -3594,6 +3594,11 @@ impl AccountsDb {
     where
         F: FnMut(Option<(&Pubkey, AccountSharedData, Slot)>),
     {
+        // Parallelize do_load across the background pool. Keys must be collected first:
+        // holding secondary-index (DashMap/scc) guards across blocking I/O or channel
+        // sends deadlocks replay/clean, which need those same locks to insert/remove.
+        const INDEX_SCAN_CHUNK_SIZE: usize = 8_192;
+
         let key = match &index_key {
             IndexKey::ProgramId(key) => key,
             IndexKey::SplTokenMint(key) => key,
@@ -3623,16 +3628,27 @@ impl AccountsDb {
             &max_root_ancestors
         };
 
-        for pubkey in self.accounts_index.get_index_key_pubkeys(&index_key) {
+        let pubkeys = self.accounts_index.get_index_key_pubkeys(&index_key);
+        for chunk in pubkeys.chunks(INDEX_SCAN_CHUNK_SIZE) {
             if config.is_aborted() {
                 break;
             }
-            if let Some((account, slot)) = self.do_load(
-                ancestors,
-                &pubkey,
-                LoadHint::Unspecified,
-                PopulateReadCache::False,
-            ) {
+            let loaded: Vec<(Pubkey, AccountSharedData, Slot)> =
+                self.thread_pool_background.install(|| {
+                    chunk
+                        .par_iter()
+                        .filter_map(|pubkey| {
+                            self.do_load(
+                                ancestors,
+                                pubkey,
+                                LoadHint::Unspecified,
+                                PopulateReadCache::False,
+                            )
+                            .map(|(account, slot)| (*pubkey, account, slot))
+                        })
+                        .collect()
+                });
+            for (pubkey, account, slot) in loaded {
                 scan_func(Some((&pubkey, account, slot)));
             }
         }
@@ -3646,6 +3662,89 @@ impl AccountsDb {
         }
         let used_index = true;
         Ok(used_index)
+    }
+
+    /// Like [`Self::index_scan_accounts`], but invokes `scan_func` on the background
+    /// pool in the same parallel pass as `do_load` (no serial fold after load).
+    /// `scan_func` must be safe for concurrent calls.
+    ///
+    /// Loads use `ancestors`, so the results are a snapshot of the calling bank's fork
+    /// view even while newer slots keep rooting mid-scan. Callers pair this snapshot
+    /// with per-slot deltas applied strictly after the calling bank, so unlike
+    /// [`Self::index_scan_accounts`] this scan refuses (rather than silently degrades
+    /// to a roots-only view) when the calling bank is not descended from the pinned
+    /// scan root.
+    ///
+    /// Returns `used_index`.
+    pub(crate) fn index_scan_accounts_parallel<F>(
+        &self,
+        ancestors: &Ancestors,
+        bank_id: BankId,
+        index_key: IndexKey,
+        scan_func: F,
+        config: &ScanConfig,
+    ) -> ScanResult<bool>
+    where
+        F: Fn(Option<(&Pubkey, AccountSharedData, Slot)>) + Sync,
+    {
+        const INDEX_SCAN_CHUNK_SIZE: usize = 8_192;
+
+        let key = match &index_key {
+            IndexKey::ProgramId(key) => key,
+            IndexKey::SplTokenMint(key) => key,
+            IndexKey::SplTokenOwner(key) => key,
+        };
+        if !self.account_indexes.include_key(key) {
+            // Fallback path is sequential; callers that need parallelism rely on the index.
+            self.scan_accounts(ancestors, bank_id, |tuple| scan_func(tuple), config)?;
+            return Ok(false);
+        }
+
+        let scan_guard = ScanGuard::try_new(&self.scan_tracker, bank_id, || {
+            self.accounts_index.max_root_inclusive()
+        })
+        .ok_or(ScanError::SlotRemoved {
+            slot: ancestors.max_slot(),
+            bank_id,
+        })?;
+
+        if !scan_guard.should_use_ancestors(ancestors) {
+            // The calling bank is not descended from the pinned max root, so its
+            // ancestors may reference already-cleaned slots. A roots-only fallback
+            // would silently move the snapshot boundary; refuse instead.
+            return Err(ScanError::Aborted(format!(
+                "bank slot {} (id {bank_id}) is not descended from scan root {}",
+                ancestors.max_slot(),
+                scan_guard.max_root(),
+            )));
+        }
+
+        let pubkeys = self.accounts_index.get_index_key_pubkeys(&index_key);
+        for chunk in pubkeys.chunks(INDEX_SCAN_CHUNK_SIZE) {
+            if config.is_aborted() {
+                break;
+            }
+            self.thread_pool_background.install(|| {
+                chunk.par_iter().for_each(|pubkey| {
+                    if let Some((account, slot)) = self.do_load(
+                        ancestors,
+                        pubkey,
+                        LoadHint::Unspecified,
+                        PopulateReadCache::False,
+                    ) {
+                        scan_func(Some((pubkey, account, slot)));
+                    }
+                });
+            });
+        }
+
+        if scan_guard.was_scan_corrupted() {
+            return Err(ScanError::SlotRemoved {
+                slot: ancestors.max_slot(),
+                bank_id,
+            });
+        }
+        Ok(true)
     }
 
     /// Scan a specific slot through all the account storage

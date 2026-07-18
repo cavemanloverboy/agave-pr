@@ -1,0 +1,40 @@
+[package]
+name = "agave-block-verify"
+description = "Block verification hooks that scan program-owned accounts on bank freeze"
+documentation = "https://docs.rs/agave-block-verify"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[lib]
+crate-type = ["lib"]
+name = "agave_block_verify"
+
+[features]
+agave-unstable-api = []
+dev-context-only-utils = ["solana-runtime/dev-context-only-utils"]
+
+[dependencies]
+log = { workspace = true }
+scc = { workspace = true }
+solana-account = { workspace = true }
+solana-accounts-db = { workspace = true }
+solana-clock = { workspace = true }
+solana-program-pack = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-runtime = { workspace = true }
+spl-token-interface = { workspace = true }
+
+[dev-dependencies]
+solana-genesis-config = { workspace = true }
+solana-program-option = { workspace = true }
+solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
+
+[lints]
+workspace = true

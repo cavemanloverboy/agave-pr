@@ -467,6 +467,7 @@ impl ClusterInfoVoteListener {
                     verified_vote_transactions_receiver,
                     vote_tracker,
                     sharable_banks,
+                    bank_forks,
                     replay_votes_receiver,
                     blockstore,
                     notifiers,
@@ -591,6 +592,7 @@ impl ClusterInfoVoteListener {
         gossip_vote_txs_receiver: VerifiedVoteTransactionsReceiver,
         vote_tracker: Arc<VoteTracker>,
         sharable_banks: SharableBanks,
+        bank_forks: Arc<RwLock<BankForks>>,
         replay_votes_receiver: ReplayVoteReceiver,
         blockstore: Arc<Blockstore>,
         notifiers: ConfirmationNotifiers,
@@ -601,6 +603,11 @@ impl ClusterInfoVoteListener {
         let mut last_process_root = Instant::now();
         let mut vote_processing_time = Some(VoteProcessingTiming::default());
         let mut replay_vote_buffer = VoteBuffer::new();
+        // Confirmed-tier verifier scheduling: the highest optimistically
+        // confirmed (slot, bank hash) whose bank has not run the verifiers
+        // yet, and the last slot that has.
+        let mut confirmed_verify_pending: Option<(Slot, Hash)> = None;
+        let mut confirmed_verify_last_slot: Slot = 0;
         loop {
             if exit.load(Ordering::Relaxed) {
                 return Ok(());
@@ -634,7 +641,7 @@ impl ClusterInfoVoteListener {
             );
             match confirmed_slots {
                 Ok(confirmed_slots) => {
-                    let confirmed_slots = confirmed_slots
+                    let confirmed_slots: Vec<_> = confirmed_slots
                         .into_iter()
                         .filter(|(slot, _hash)| {
                             notifiers
@@ -642,6 +649,12 @@ impl ClusterInfoVoteListener {
                                 .should_report_commitment_or_root(*slot)
                         })
                         .collect();
+                    confirmed_verify_pending = confirmed_verify_pending.max(
+                        confirmed_slots
+                            .iter()
+                            .max_by_key(|(slot, _hash)| *slot)
+                            .copied(),
+                    );
                     confirmation_verifier
                         .add_new_optimistic_confirmed_slots(confirmed_slots, &blockstore);
                 }
@@ -655,6 +668,64 @@ impl ClusterInfoVoteListener {
                     }
                 },
             }
+            Self::run_confirmed_verifiers_if_frozen(
+                &bank_forks,
+                &mut confirmed_verify_pending,
+                &mut confirmed_verify_last_slot,
+            );
+        }
+    }
+
+    /// Runs confirmed-tier verifiers on the highest optimistically confirmed
+    /// bank once it is frozen locally with the confirmed hash.
+    ///
+    /// Optimistic confirmation can outrun local replay, so the newest confirmed
+    /// slot stays pending until its bank freezes (retried every loop iteration,
+    /// ≤200ms apart). Verifiers walk parent chains from their last verified
+    /// slot, so tracking only the highest confirmed slot is lossless:
+    /// intermediate confirmed slots are covered by the walk.
+    fn run_confirmed_verifiers_if_frozen(
+        bank_forks: &RwLock<BankForks>,
+        pending: &mut Option<(Slot, Hash)>,
+        last_verified_slot: &mut Slot,
+    ) {
+        let Some((slot, hash)) = *pending else {
+            return;
+        };
+        if slot <= *last_verified_slot {
+            *pending = None;
+            return;
+        }
+        let (bank, root) = {
+            let bank_forks = bank_forks.read().unwrap();
+            (bank_forks.get(slot), bank_forks.root())
+        };
+        match bank {
+            Some(bank) if bank.is_frozen() => {
+                *pending = None;
+                if bank.hash() != hash {
+                    // Local replay froze a different (duplicate) version of the
+                    // confirmed slot; it will be dumped and repaired. Skip it —
+                    // a later confirmed slot's parent-chain walk covers the
+                    // corrected writes.
+                    warn!(
+                        "confirmed verifiers: local bank hash {} for slot {slot} does not \
+                         match confirmed hash {hash}; skipping",
+                        bank.hash(),
+                    );
+                    return;
+                }
+                *last_verified_slot = slot;
+                solana_runtime::confirmed_verifier::run_confirmed_verifiers(&bank);
+            }
+            // Bank exists but replay has not frozen it yet: retry.
+            Some(_) => {}
+            // Rooted past the slot before its bank was verified (or the slot's
+            // bank was dumped as a duplicate). A later confirmed slot's
+            // parent-chain walk covers the skipped writes.
+            None if slot <= root => *pending = None,
+            // Bank not created yet (local replay lagging confirmation): retry.
+            None => {}
         }
     }
 
@@ -2245,5 +2316,70 @@ mod tests {
             &mut latest_vote_slot_per_validator,
         );
         assert_eq!(diff.keys().copied().sorted().collect_vec(), vec![7, 8]);
+    }
+
+    #[test]
+    fn test_run_confirmed_verifiers_if_frozen_defers_until_frozen() {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(1_000);
+        let (bank0, bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        let bank1 = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
+        bank_forks.write().unwrap().insert(bank1);
+
+        // Bank exists but is not frozen: the slot stays pending.
+        let mut pending = Some((1, Hash::default()));
+        let mut last_verified_slot = 0;
+        ClusterInfoVoteListener::run_confirmed_verifiers_if_frozen(
+            &bank_forks,
+            &mut pending,
+            &mut last_verified_slot,
+        );
+        assert_eq!(pending, Some((1, Hash::default())));
+        assert_eq!(last_verified_slot, 0);
+
+        // Bank not created yet: the slot stays pending.
+        pending = Some((2, Hash::default()));
+        ClusterInfoVoteListener::run_confirmed_verifiers_if_frozen(
+            &bank_forks,
+            &mut pending,
+            &mut last_verified_slot,
+        );
+        assert_eq!(pending, Some((2, Hash::default())));
+
+        // Frozen with the confirmed hash: verifiers run and the slot is recorded.
+        let bank1 = bank_forks.read().unwrap().get(1).unwrap();
+        bank1.freeze();
+        pending = Some((1, bank1.hash()));
+        ClusterInfoVoteListener::run_confirmed_verifiers_if_frozen(
+            &bank_forks,
+            &mut pending,
+            &mut last_verified_slot,
+        );
+        assert_eq!(pending, None);
+        assert_eq!(last_verified_slot, 1);
+
+        // A stale pending slot (≤ last verified) is dropped without running.
+        pending = Some((1, bank1.hash()));
+        ClusterInfoVoteListener::run_confirmed_verifiers_if_frozen(
+            &bank_forks,
+            &mut pending,
+            &mut last_verified_slot,
+        );
+        assert_eq!(pending, None);
+        assert_eq!(last_verified_slot, 1);
+
+        // A frozen bank whose hash differs from the confirmed hash (duplicate
+        // block) is skipped without advancing the last verified slot.
+        let bank2 = Bank::new_from_parent(bank1, SlotLeader::default(), 2);
+        bank_forks.write().unwrap().insert(bank2);
+        bank_forks.read().unwrap().get(2).unwrap().freeze();
+        pending = Some((2, Hash::default()));
+        ClusterInfoVoteListener::run_confirmed_verifiers_if_frozen(
+            &bank_forks,
+            &mut pending,
+            &mut last_verified_slot,
+        );
+        assert_eq!(pending, None);
+        assert_eq!(last_verified_slot, 1);
     }
 }

@@ -527,7 +527,10 @@ pub fn execute(
 
     let contact_debug_interval = value_t_or_exit!(matches, "contact_debug_interval", u64);
 
-    let account_indexes = AccountSecondaryIndexes::from_clap_arg_match(matches)?;
+    agave_block_verify::install_default_block_verifiers();
+    let account_indexes = agave_block_verify::merge_account_secondary_indexes(
+        AccountSecondaryIndexes::from_clap_arg_match(matches)?,
+    );
 
     let restricted_repair_only_mode = matches.is_present("restricted_repair_only_mode");
     let accounts_shrink_optimize_total_space =

@@ -3,6 +3,7 @@ use {
     crate::{
         args::*,
         bigtable::*,
+        block_verify::*,
         blockstore::*,
         ledger_path::*,
         ledger_utils::*,
@@ -104,6 +105,7 @@ use {
 
 mod args;
 mod bigtable;
+mod block_verify;
 mod blockstore;
 mod error;
 mod ledger_path;
@@ -1621,6 +1623,14 @@ fn main() {
                 ),
         )
         .subcommand(
+            block_verify_subcommand(
+                &load_genesis_config_arg,
+                &accounts_db_config_args,
+                &snapshot_config_args,
+                &halt_at_slot_arg,
+            ),
+        )
+        .subcommand(
             SubCommand::with_name("capitalization")
                 .about("Print capitalization (aka, total supply) while checksumming it")
                 .arg(&load_genesis_config_arg)
@@ -2702,6 +2712,9 @@ fn main() {
                             exit(1);
                         }
                     };
+                }
+                ("block-verify", Some(arg_matches)) => {
+                    block_verify_command(&ledger_path, arg_matches);
                 }
                 ("accounts", Some(arg_matches)) => {
                     let process_options = parse_process_options(&ledger_path, arg_matches);

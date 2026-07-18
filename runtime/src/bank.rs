@@ -5157,6 +5157,26 @@ impl Bank {
         )
     }
 
+    /// Stream indexed accounts through `callback` without collecting them into a Vec.
+    pub fn scan_filtered_indexed_accounts<F, G>(
+        &self,
+        index_key: &IndexKey,
+        filter: F,
+        callback: G,
+    ) -> ScanResult<()>
+    where
+        F: Fn(&AccountSharedData) -> bool,
+        G: FnMut(&Pubkey, AccountSharedData),
+    {
+        self.rc.accounts.scan_by_index_key_with_filter(
+            &self.ancestors,
+            self.bank_id,
+            index_key,
+            filter,
+            callback,
+        )
+    }
+
     pub fn account_indexes_include_key(&self, key: &Pubkey) -> bool {
         self.rc.accounts.account_indexes_include_key(key)
     }

@@ -17,6 +17,7 @@ pub mod block_component_processor;
 pub mod commitment;
 #[cfg(any(feature = "conformance", feature = "dev-context-only-utils"))]
 pub mod conformance;
+pub mod confirmed_verifier;
 pub mod dependency_tracker;
 pub mod epoch_stakes;
 pub mod genesis_utils;

@@ -1,11 +1,12 @@
 use {
     dashmap::{DashMap, mapref::entry::Entry as DashMapEntry},
     log::*,
+    scc::HashSet as SccHashSet,
     solana_pubkey::Pubkey,
     solana_time_utils::AtomicInterval,
     std::{
         collections::HashSet,
-        fmt::Debug,
+        fmt::{self, Debug},
         sync::{
             RwLock,
             atomic::{AtomicU64, Ordering},
@@ -67,6 +68,9 @@ pub trait SecondaryIndexEntry: Debug {
     fn is_empty(&self) -> bool;
     fn keys(&self) -> Vec<Pubkey>;
     fn len(&self) -> usize;
+    /// Visit each inner key. Return `false` from `f` to stop early.
+    /// Returns whether iteration completed without early stop.
+    fn for_each_key(&self, f: impl FnMut(&Pubkey) -> bool) -> bool;
 }
 
 #[derive(Debug, Default)]
@@ -75,38 +79,54 @@ struct SecondaryIndexStats {
     num_inner_keys: AtomicU64,
 }
 
-#[derive(Debug, Default)]
+/// Secondary-index entry storing the set of inner keys (e.g. account pubkeys for a
+/// program-id outer key).
+///
+/// Uses [`scc::HashSet`] so concurrent inserts into a hot outer key (notably SPL Token's
+/// program-id bucket during index generation) do not serialize on a single `RwLock`.
+#[derive(Default)]
 pub struct RwLockSecondaryIndexEntry {
-    account_keys: RwLock<HashSet<Pubkey>>,
+    account_keys: SccHashSet<Pubkey>,
+}
+
+impl Debug for RwLockSecondaryIndexEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RwLockSecondaryIndexEntry")
+            .field("len", &self.account_keys.len())
+            .finish()
+    }
 }
 
 impl SecondaryIndexEntry for RwLockSecondaryIndexEntry {
     fn insert_if_not_exists(&self, key: &Pubkey, inner_keys_count: &AtomicU64) {
-        if self.account_keys.read().unwrap().contains(key) {
-            // the key already exists, so nothing to do here
-            return;
-        }
-
-        let was_newly_inserted = self.account_keys.write().unwrap().insert(*key);
-        if was_newly_inserted {
+        if self.account_keys.insert_sync(*key).is_ok() {
             inner_keys_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     fn remove_inner_key(&self, key: &Pubkey) -> bool {
-        self.account_keys.write().unwrap().remove(key)
+        self.account_keys.remove_sync(key).is_some()
     }
 
     fn is_empty(&self) -> bool {
-        self.account_keys.read().unwrap().is_empty()
+        self.account_keys.is_empty()
     }
 
     fn keys(&self) -> Vec<Pubkey> {
-        self.account_keys.read().unwrap().iter().cloned().collect()
+        let mut keys = Vec::with_capacity(self.account_keys.len());
+        self.for_each_key(|key| {
+            keys.push(*key);
+            true
+        });
+        keys
     }
 
     fn len(&self) -> usize {
-        self.account_keys.read().unwrap().len()
+        self.account_keys.len()
+    }
+
+    fn for_each_key(&self, f: impl FnMut(&Pubkey) -> bool) -> bool {
+        self.account_keys.iter_sync(f)
     }
 }
 

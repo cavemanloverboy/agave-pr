@@ -432,6 +432,70 @@ impl Accounts {
         Self::maybe_abort_scan(result, &config)
     }
 
+    /// Stream accounts matching `index_key` through `callback` without collecting them.
+    pub fn scan_by_index_key_with_filter<F, G>(
+        &self,
+        ancestors: &Ancestors,
+        bank_id: BankId,
+        index_key: &IndexKey,
+        filter: F,
+        mut callback: G,
+    ) -> ScanResult<()>
+    where
+        F: Fn(&AccountSharedData) -> bool,
+        G: FnMut(&Pubkey, AccountSharedData),
+    {
+        self.accounts_db
+            .index_scan_accounts(
+                ancestors,
+                bank_id,
+                *index_key,
+                |some_account_tuple| {
+                    if let Some((pubkey, account, _slot)) = some_account_tuple {
+                        if account.is_loadable() && filter(&account) {
+                            callback(pubkey, account);
+                        }
+                    }
+                },
+                &ScanConfig::default(),
+            )
+            .map(|_| ())
+    }
+
+    /// Parallel index scan: load + callback run together on the accounts-db background pool.
+    /// `callback` must tolerate concurrent invocation.
+    ///
+    /// Results are a snapshot of the calling bank's fork view (its `ancestors`), stable
+    /// against newer slots rooting while the scan runs.
+    pub fn scan_by_index_key_parallel<F, G>(
+        &self,
+        ancestors: &Ancestors,
+        bank_id: BankId,
+        index_key: &IndexKey,
+        filter: F,
+        callback: G,
+    ) -> ScanResult<()>
+    where
+        F: Fn(&AccountSharedData) -> bool + Sync,
+        G: Fn(&Pubkey, AccountSharedData) + Sync,
+    {
+        self.accounts_db
+            .index_scan_accounts_parallel(
+                ancestors,
+                bank_id,
+                *index_key,
+                |some_account_tuple| {
+                    if let Some((pubkey, account, _slot)) = some_account_tuple {
+                        if account.is_loadable() && filter(&account) {
+                            callback(pubkey, account);
+                        }
+                    }
+                },
+                &ScanConfig::default(),
+            )
+            .map(|_used_index| ())
+    }
+
     pub fn account_indexes_include_key(&self, key: &Pubkey) -> bool {
         self.accounts_db.account_indexes.include_key(key)
     }

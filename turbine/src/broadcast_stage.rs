@@ -474,6 +474,7 @@ pub fn broadcast_shreds(
         let bank_forks = bank_forks.read().unwrap();
         (bank_forks.root_bank(), bank_forks.working_bank())
     };
+    let rtt = cluster_info.tvu_rtt_cache();
     let packets: Vec<_> = shreds
         .iter()
         .chunk_by(|shred| shred.slot())
@@ -487,7 +488,7 @@ pub fn broadcast_shreds(
                 let key = shred.id();
                 let addr = cluster_nodes
                     .get_broadcast_peer(&key)?
-                    .tvu(Protocol::UDP)
+                    .select_tvu(Protocol::UDP, rtt)
                     .filter(|addr| !addr.is_ipv6() && socket_addr_space.check(addr))?;
 
                 Some((shred.payload(), addr))

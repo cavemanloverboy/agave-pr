@@ -165,6 +165,7 @@ pub struct ClusterInfo {
     contact_info_path: PathBuf,
     socket_addr_space: SocketAddrSpace,
     bind_ip_addrs: Arc<BindIpAddrs>,
+    tvu_rtt: crate::tvu_rtt::TvuRttCache,
 }
 
 impl ClusterInfo {
@@ -195,6 +196,7 @@ impl ClusterInfo {
             contact_save_interval: 0, // disabled
             socket_addr_space,
             bind_ip_addrs: Arc::new(BindIpAddrs::default()),
+            tvu_rtt: crate::tvu_rtt::TvuRttCache::default(),
         };
         me.refresh_my_gossip_contact_info();
         me
@@ -418,6 +420,44 @@ impl ClusterInfo {
             .set_tvu(contact_info::Protocol::UDP, tvu_addr)?;
         self.refresh_my_gossip_contact_info();
         Ok(())
+    }
+
+    pub fn set_tvu_relays(&self, relays: &[SocketAddr]) -> Result<(), ContactInfoError> {
+        self.my_contact_info
+            .write()
+            .unwrap()
+            .set_tvu_relays(relays)?;
+        self.refresh_my_gossip_contact_info();
+        Ok(())
+    }
+
+    pub fn tvu_rtt_cache(&self) -> &crate::tvu_rtt::TvuRttCache {
+        &self.tvu_rtt
+    }
+
+    pub fn record_tvu_rtt(&self, addr: SocketAddr, rtt: std::time::Duration) {
+        self.tvu_rtt.record(addr, rtt);
+    }
+
+    /// Primary and relay TVU sockets for every peer on this shred version,
+    /// excluding this node's own destinations.
+    pub fn remote_tvu_destinations(&self) -> Vec<SocketAddr> {
+        let mine: std::collections::HashSet<SocketAddr> = self
+            .my_contact_info()
+            .tvu_destinations()
+            .into_iter()
+            .collect();
+        let mut dests = Vec::new();
+        for addrs in self.tvu_peers(|node| node.tvu_destinations()) {
+            for addr in addrs {
+                if !mine.contains(&addr) {
+                    dests.push(addr);
+                }
+            }
+        }
+        dests.sort_unstable();
+        dests.dedup();
+        dests
     }
 
     pub fn set_tpu_quic(&self, tpu_addr: SocketAddr) -> Result<(), ContactInfoError> {
@@ -2374,6 +2414,8 @@ pub struct NodeConfig {
     pub public_tpu_addr: Option<SocketAddr>,
     pub public_tpu_forwards_addr: Option<SocketAddr>,
     pub public_tvu_addr: Option<SocketAddr>,
+    /// Extra TVU sockets advertised for this node. Senders pick the closest.
+    pub tvu_relays: Vec<SocketAddr>,
 
     /// The number of TVU receive sockets to create
     pub num_tvu_receive_sockets: NonZeroUsize,
@@ -2858,6 +2900,7 @@ mod tests {
             public_tpu_addr: None,
             public_tpu_forwards_addr: None,
             public_tvu_addr: None,
+            tvu_relays: Vec::new(),
             num_tvu_receive_sockets: MINIMUM_NUM_TVU_RECEIVE_SOCKETS,
             num_tvu_retransmit_sockets: MINIMUM_NUM_TVU_RECEIVE_SOCKETS,
             num_quic_endpoints: DEFAULT_NUM_QUIC_ENDPOINTS,
@@ -2883,6 +2926,7 @@ mod tests {
             public_tpu_addr: None,
             public_tpu_forwards_addr: None,
             public_tvu_addr: None,
+            tvu_relays: Vec::new(),
             num_tvu_receive_sockets: MINIMUM_NUM_TVU_RECEIVE_SOCKETS,
             num_tvu_retransmit_sockets: MINIMUM_NUM_TVU_RECEIVE_SOCKETS,
             num_quic_endpoints: DEFAULT_NUM_QUIC_ENDPOINTS,

@@ -53,12 +53,14 @@ fn get_retransmit_peers_deterministic(
         &mut stats,
     );
 
+    let rtt = solana_gossip::tvu_rtt::TvuRttCache::default();
     for shred in shreds {
         let _retransmit_peers = cluster_nodes.get_retransmit_addrs(
             slot_leader,
             &shred.id(),
             200, // fanout
             &SocketAddrSpace::Unspecified,
+            &rtt,
         );
     }
 }

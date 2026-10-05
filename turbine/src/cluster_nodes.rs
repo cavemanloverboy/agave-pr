@@ -69,6 +69,7 @@ pub(crate) struct ContactInfo {
     pubkey: Pubkey,
     wallclock: u64,
     tvu_udp: Option<SocketAddr>,
+    tvu_relays: Vec<SocketAddr>,
 }
 
 pub struct Node {
@@ -141,6 +142,19 @@ impl ContactInfo {
         match protocol {
             Protocol::QUIC => None,
             Protocol::UDP => self.tvu_udp,
+        }
+    }
+
+    /// UDP destination for this node: lowest fresh ping among the primary
+    /// TVU and its relays, or the primary when nothing has been measured.
+    pub(crate) fn select_tvu(
+        &self,
+        protocol: Protocol,
+        rtt: &solana_gossip::tvu_rtt::TvuRttCache,
+    ) -> Option<SocketAddr> {
+        match protocol {
+            Protocol::QUIC => None,
+            Protocol::UDP => rtt.select(self.tvu_udp, &self.tvu_relays),
         }
     }
 
@@ -265,6 +279,7 @@ impl ClusterNodes<RetransmitStage> {
         shred: &ShredId,
         fanout: usize,
         socket_addr_space: &SocketAddrSpace,
+        rtt: &solana_gossip::tvu_rtt::TvuRttCache,
     ) -> Result<(/*root_distance:*/ u8, Vec<SocketAddr>), Error> {
         // Exclude slot leader from list of nodes.
         if slot_leader == &self.pubkey {
@@ -286,7 +301,7 @@ impl ClusterNodes<RetransmitStage> {
             );
             let protocol = get_broadcast_protocol(shred);
             let peers = peers
-                .filter_map(|k| self.nodes[k].contact_info()?.tvu(protocol))
+                .filter_map(|k| self.nodes[k].contact_info()?.select_tvu(protocol, rtt))
                 .filter(|addr| !addr.is_ipv6() && socket_addr_space.check(addr))
                 .collect();
             let root_distance = get_root_distance(index, fanout);
@@ -365,6 +380,71 @@ pub fn new_cluster_nodes<T: 'static>(
         weighted_shuffle,
         _phantom: PhantomData,
         use_cha_cha_8,
+    }
+}
+
+pub(crate) struct RelayNodeInput {
+    pub pubkey: Pubkey,
+    pub stake: u64,
+    pub wallclock: u64,
+    pub tvu: Option<SocketAddr>,
+    pub relays: Vec<SocketAddr>,
+}
+
+impl ClusterNodes<RetransmitStage> {
+    /// Turbine tree for a relay standing in for `self_pubkey`.
+    ///
+    /// The relay is not its own stake-weighted identity. `self_pubkey` is the
+    /// validator it receives and retransmits for.
+    pub(crate) fn from_relay_nodes(
+        self_pubkey: Pubkey,
+        inputs: Vec<RelayNodeInput>,
+        use_cha_cha_8: bool,
+        dedup_tvu: bool,
+    ) -> Self {
+        let mut nodes: Vec<Node> = inputs
+            .into_iter()
+            .map(|input| {
+                let stake = input.stake;
+                let node = if input.tvu.is_none() && input.relays.is_empty() {
+                    NodeId::Pubkey(input.pubkey)
+                } else {
+                    NodeId::ContactInfo(ContactInfo {
+                        pubkey: input.pubkey,
+                        wallclock: input.wallclock,
+                        tvu_udp: input.tvu,
+                        tvu_relays: input.relays,
+                    })
+                };
+                Node { node, stake }
+            })
+            .collect();
+        sort_and_dedup_nodes(&mut nodes);
+        if dedup_tvu {
+            dedup_tvu_addrs(&mut nodes);
+        }
+        if !nodes.iter().any(|node| node.pubkey() == &self_pubkey) {
+            nodes.push(Node {
+                node: NodeId::Pubkey(self_pubkey),
+                stake: 0,
+            });
+            sort_and_dedup_nodes(&mut nodes);
+        }
+        let index: HashMap<_, _> = nodes
+            .iter()
+            .enumerate()
+            .map(|(ix, node)| (*node.pubkey(), ix))
+            .collect();
+        let stakes = nodes.iter().map(|node| node.stake);
+        let weighted_shuffle = WeightedShuffle::new("cluster-nodes", stakes);
+        ClusterNodes {
+            pubkey: self_pubkey,
+            nodes,
+            index,
+            weighted_shuffle,
+            _phantom: PhantomData,
+            use_cha_cha_8,
+        }
     }
 }
 
@@ -645,6 +725,7 @@ impl From<&GossipContactInfo> for ContactInfo {
             pubkey: *node.pubkey(),
             wallclock: node.wallclock(),
             tvu_udp: node.tvu(Protocol::UDP),
+            tvu_relays: node.tvu_relays().to_vec(),
         }
     }
 }

@@ -1,0 +1,31 @@
+[package]
+name = "agave-tvu-relay"
+documentation = "https://docs.rs/agave-tvu-relay"
+version = { workspace = true }
+authors = { workspace = true }
+description = "Lightweight TVU relay for one Agave validator."
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[[bin]]
+name = "agave-tvu-relay"
+path = "src/main.rs"
+bench = false
+
+[features]
+agave-unstable-api = []
+
+[dependencies]
+bincode = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+solana-clap-utils = { workspace = true }
+solana-gossip = { workspace = true, features = ["agave-unstable-api"] }
+agave-logger = { workspace = true, features = ["agave-unstable-api"] }
+solana-keypair = { workspace = true }
+solana-net-utils = { workspace = true }
+solana-signer = { workspace = true }
+solana-turbine = { workspace = true, features = ["agave-unstable-api"] }
+solana-version = { workspace = true }

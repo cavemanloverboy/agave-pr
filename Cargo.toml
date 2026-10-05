@@ -116,6 +116,7 @@ members = [
     "transaction-status-client-types",
     "transaction-view",
     "turbine",
+    "tvu-relay",
     "udp-client",
     "unified-scheduler-logic",
     "unified-scheduler-pool",

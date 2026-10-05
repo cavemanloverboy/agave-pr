@@ -104,6 +104,7 @@ impl Node {
             public_tpu_addr: None,
             public_tpu_forwards_addr: None,
             public_tvu_addr: None,
+            tvu_relays: Vec::new(),
             num_tvu_receive_sockets: NonZero::new(1).unwrap(),
             num_tvu_retransmit_sockets: NonZero::new(1).unwrap(),
             num_quic_endpoints: NonZero::new(DEFAULT_QUIC_ENDPOINTS)
@@ -127,6 +128,7 @@ impl Node {
             public_tpu_addr,
             public_tpu_forwards_addr,
             public_tvu_addr,
+            tvu_relays,
             num_tvu_receive_sockets,
             num_tvu_retransmit_sockets,
             num_quic_endpoints,
@@ -357,6 +359,10 @@ impl Node {
             public_tvu_addr.unwrap_or_else(|| SocketAddr::new(advertised_ip, tvu_port)),
         )
         .unwrap();
+        if !tvu_relays.is_empty() {
+            info.set_tvu_relays(&tvu_relays)
+                .expect("valid TVU relay addresses");
+        }
         // placeholder to prevent legacy nodes from assuming we do not have open TPU ports
         // see https://github.com/anza-xyz/agave/pull/10174
         info.set_tpu(

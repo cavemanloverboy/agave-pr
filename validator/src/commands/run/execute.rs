@@ -271,6 +271,15 @@ pub fn execute(
         public_tpu_addr,
         public_tpu_forwards_addr,
         public_tvu_addr,
+        tvu_relays: matches
+            .values_of("tvu_relay_addr")
+            .into_iter()
+            .flatten()
+            .map(|addr| {
+                solana_net_utils::parse_host_port(addr)
+                    .map_err(|err| format!("failed to parse --tvu-relay-address: {err}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         num_tvu_receive_sockets: tvu_receive_threads,
         num_tvu_retransmit_sockets: tvu_retransmit_threads,
         num_quic_endpoints,
@@ -913,6 +922,13 @@ pub fn execute(
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
         disable_block_production: matches.is_present("disable_block_production"),
+        tvu_relay_feed_addr: matches
+            .value_of("tvu_relay_feed_addr")
+            .map(|addr| {
+                solana_net_utils::parse_host_port(addr)
+                    .map_err(|err| format!("failed to parse --tvu-relay-feed-address: {err}"))
+            })
+            .transpose()?,
         enable_scheduler_bindings: matches.is_present("enable_scheduler_bindings"),
         banking_trace_dir_byte_limit: parse_banking_trace_dir_byte_limit(matches),
         validator_exit: Arc::new(RwLock::new(Exit::default())),

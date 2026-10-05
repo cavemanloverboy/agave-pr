@@ -11,6 +11,8 @@ pub mod retransmit_stage;
 
 pub mod sigverify_shreds;
 
+pub mod tvu_relay;
+
 pub mod xdp_sender;
 
 pub use crate::xdp_sender::XdpSender;

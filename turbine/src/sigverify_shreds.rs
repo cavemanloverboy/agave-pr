@@ -5,7 +5,6 @@ use {
     },
     agave_feature_set as feature_set,
     crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender},
-    itertools::{Either, Itertools},
     rayon::{ThreadPool, ThreadPoolBuilder, prelude::*},
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
@@ -238,28 +237,44 @@ fn run_shred_sigverify<const K: usize>(
     });
     stats.resign_micros += resign_start.elapsed().as_micros() as u64;
     // Extract shred payload from packets, and separate out repaired shreds.
-    let (shreds, repairs): (Vec<_>, Vec<_>) = shred_buffer
+    // Shreds that arrived from one of our TVU relays were already retransmitted
+    // by that relay. Still insert them, but do not fan them out again.
+    let relay_srcs: std::collections::HashSet<std::net::SocketAddr> = cluster_info
+        .my_contact_info()
+        .tvu_relays()
+        .iter()
+        .copied()
+        .collect();
+    let mut shreds = Vec::new();
+    let mut verified = Vec::new();
+    for packet in shred_buffer
         .iter()
         .flat_map(|batch| batch.iter())
         .filter(|packet| !packet.meta().discard())
-        .filter_map(|packet| {
+    {
+        let Some((shred, location)) =
             extract_shred_and_location(packet, repair_nonce_location_lookup, stats)
-        })
-        .partition_map(|(shred, location)| {
-            if let Some(location) = location {
-                // No need for Arc overhead here because repaired shreds are
-                // not retranmitted.
-                Either::Right((
-                    shred::Payload::from(shred),
-                    /* is_repaired */ true,
-                    location,
-                ))
-            } else {
-                // Share the payload between the retransmit-stage and the
-                // window-service.
-                Either::Left(shred::Payload::from(shred))
+        else {
+            continue;
+        };
+        if let Some(location) = location {
+            verified.push((
+                shred::Payload::from(shred),
+                /* is_repaired */ true,
+                location,
+            ));
+        } else {
+            let payload = shred::Payload::from(shred);
+            if !relay_srcs.contains(&packet.meta().socket_addr()) {
+                shreds.push(payload.clone());
             }
-        });
+            verified.push((
+                payload,
+                /*is_repaired:*/ false,
+                BlockLocation::Original,
+            ));
+        }
+    }
 
     // Repaired shreds are not retransmitted.
     stats.num_retransmit_shreds += shreds.len();
@@ -272,10 +287,7 @@ fn run_shred_sigverify<const K: usize>(
         }
     }
     // Send all shreds to window service to be inserted into blockstore.
-    let shreds = shreds
-        .into_iter()
-        .map(|shred| (shred, /*is_repaired:*/ false, BlockLocation::Original));
-    verified_sender.send(shreds.chain(repairs).collect())?;
+    verified_sender.send(verified)?;
     stats.elapsed_micros += now.elapsed().as_micros() as u64;
     shred_buffer.clear();
     Ok(())

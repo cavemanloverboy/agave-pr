@@ -2,7 +2,7 @@
 
 use {
     crate::repair::{repair_service::OutstandingShredRepairs, serve_repair::ServeRepair},
-    solana_gossip::cluster_info::ClusterInfo,
+    solana_gossip::{cluster_info::ClusterInfo, tvu_ping},
     solana_keypair::Keypair,
     solana_ledger::shred::{
         self,
@@ -53,6 +53,7 @@ impl ShredFetchStage {
         flags: PacketFlags,
         repair_context: Option<&RepairContext>,
         turbine_mode: TurbineMode,
+        echo_socket: Option<&UdpSocket>,
     ) {
         // Only repair shreds need repair context.
         debug_assert_eq!(
@@ -70,6 +71,19 @@ impl ShredFetchStage {
         for mut packet_batch in recvr {
             shred_filter_ctx.maybe_update(sharable_banks.root());
             shred_filter_ctx.stats.shred_count += packet_batch.len();
+            if let Some(echo_socket) = echo_socket {
+                for mut packet in packet_batch.iter_mut() {
+                    let size = packet.meta().size;
+                    let Some(bytes) = packet.data(..size) else {
+                        continue;
+                    };
+                    if tvu_ping::decode(bytes).is_some() {
+                        let src = packet.meta().socket_addr();
+                        let _ = echo_socket.send_to(bytes, src);
+                        packet.meta_mut().set_discard(true);
+                    }
+                }
+            }
 
             if let Some(repair_context) = repair_context {
                 debug_assert_eq!(flags, PacketFlags::REPAIR);
@@ -148,6 +162,11 @@ impl ShredFetchStage {
         let (packet_sender, packet_receiver) =
             EvictingSender::new_bounded(SHRED_FETCH_CHANNEL_SIZE);
         let receiver_stats = Arc::new(StreamerReceiveStats::new(receiver_name));
+        let echo_socket = if flags.contains(PacketFlags::REPAIR) {
+            None
+        } else {
+            sockets.first().cloned()
+        };
         let streamers = sockets
             .into_iter()
             .enumerate()
@@ -178,6 +197,7 @@ impl ShredFetchStage {
                     flags,
                     repair_context.as_ref(),
                     turbine_mode,
+                    echo_socket.as_deref(),
                 )
             })
             .unwrap();

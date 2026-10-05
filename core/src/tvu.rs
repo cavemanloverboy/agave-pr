@@ -68,7 +68,7 @@ use {
         quic::{QuicStreamerConfig, SpawnServerResult, spawn_simple_qos_server},
         streamer::StakedNodes,
     },
-    solana_turbine::{XdpSender, retransmit_stage::RetransmitStage},
+    solana_turbine::{XdpSender, retransmit_stage::RetransmitStage, tvu_relay::spawn_relay_feed},
     std::{
         collections::HashSet,
         net::UdpSocket,
@@ -111,6 +111,8 @@ pub struct Tvu {
     bls_sigverify_threads: Option<(JoinHandle<()>, JoinHandle<()>)>,
     votor: Votor,
     commitment_service: AggregateCommitmentService,
+    tvu_pinger: JoinHandle<()>,
+    tvu_relay_feed: Option<JoinHandle<()>>,
 }
 
 pub struct TvuSockets {
@@ -134,6 +136,8 @@ pub struct TvuConfig {
     pub shred_sigverify_threads: NonZeroUsize,
     pub bls_sigverify_threads: NonZeroUsize,
     pub turbine_xdp_sender: Option<XdpSender>,
+    /// TCP address that pushes leader schedule and turbine peers to TVU relays.
+    pub relay_feed_addr: Option<std::net::SocketAddr>,
 }
 
 impl Default for TvuConfig {
@@ -149,6 +153,7 @@ impl Default for TvuConfig {
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             bls_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             turbine_xdp_sender: None,
+            relay_feed_addr: None,
         }
     }
 }
@@ -587,6 +592,7 @@ impl Tvu {
         let epoch_specs: Box<dyn solana_gossip::epoch_specs::EpochSpecs> =
             Box::new(EpochSpecs::from(bank_forks.clone()));
 
+        let exit_for_relay = exit.clone();
         let duplicate_shred_listener = DuplicateShredListener::new(
             exit,
             cluster_info.clone(),
@@ -598,6 +604,20 @@ impl Tvu {
                 tvu_config.shred_version,
             ),
         );
+
+        let tvu_pinger = solana_gossip::tvu_pinger::spawn_tvu_pinger(
+            cluster_info.clone(),
+            exit_for_relay.clone(),
+        );
+        let tvu_relay_feed = tvu_config.relay_feed_addr.map(|addr| {
+            spawn_relay_feed(
+                addr,
+                cluster_info.clone(),
+                bank_forks.clone(),
+                leader_schedule_cache.clone(),
+                exit_for_relay,
+            )
+        });
 
         Ok(Tvu {
             fetch_stage,
@@ -616,6 +636,8 @@ impl Tvu {
             bls_sigverify_threads,
             votor,
             commitment_service,
+            tvu_pinger,
+            tvu_relay_feed,
         })
     }
 
@@ -641,6 +663,10 @@ impl Tvu {
         }
         self.votor.join()?;
         self.commitment_service.join()?;
+        self.tvu_pinger.join()?;
+        if let Some(feed) = self.tvu_relay_feed {
+            feed.join()?;
+        }
         Ok(())
     }
 }

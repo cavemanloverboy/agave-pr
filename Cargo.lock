@@ -336,6 +336,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-tvu-relay"
+version = "4.1.0-alpha.0"
+dependencies = [
+ "agave-logger",
+ "bincode",
+ "clap 2.33.3",
+ "log",
+ "solana-clap-utils",
+ "solana-gossip",
+ "solana-keypair",
+ "solana-net-utils",
+ "solana-signer",
+ "solana-turbine",
+ "solana-version",
+]
+
+[[package]]
 name = "agave-validator"
 version = "4.1.0-alpha.0"
 dependencies = [
@@ -11253,6 +11270,7 @@ dependencies = [
  "agave-xdp",
  "assert_matches",
  "bencher",
+ "bincode",
  "bs58",
  "bytes",
  "crossbeam-channel",
@@ -11263,6 +11281,7 @@ dependencies = [
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "rayon",
+ "serde",
  "solana-clock",
  "solana-cluster-type",
  "solana-entry",

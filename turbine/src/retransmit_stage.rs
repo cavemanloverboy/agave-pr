@@ -383,6 +383,7 @@ fn retransmit(
         })
         .collect();
     let socket_addr_space = cluster_info.socket_addr_space();
+    let rtt = cluster_info.tvu_rtt_cache();
     let record = |mut stats: HashMap<Slot, RetransmitSlotStats>, out: RetransmitShredOutput| {
         let now = timestamp();
         let entry = stats.entry(out.shred.slot()).or_default();
@@ -397,6 +398,7 @@ fn retransmit(
             &cache,
             addr_cache,
             socket_addr_space,
+            rtt,
             socket,
             stats,
         )
@@ -459,6 +461,7 @@ fn retransmit_shred(
     cache: &HashMap<Slot, (/*leader:*/ Pubkey, Arc<ClusterNodes<RetransmitStage>>)>,
     addr_cache: &AddrCache,
     socket_addr_space: &SocketAddrSpace,
+    rtt: &solana_gossip::tvu_rtt::TvuRttCache,
     socket: RetransmitSocket<'_>,
     stats: &RetransmitStats,
 ) -> Option<RetransmitShredOutput> {
@@ -471,7 +474,7 @@ fn retransmit_shred(
     }
     let mut compute_turbine_peers = Measure::start("turbine_start");
     let (root_distance, addrs) =
-        get_retransmit_addrs(&key, cache, addr_cache, socket_addr_space, stats)?;
+        get_retransmit_addrs(&key, cache, addr_cache, socket_addr_space, rtt, stats)?;
     compute_turbine_peers.stop();
     stats
         .compute_turbine_peers_total
@@ -534,6 +537,7 @@ fn get_retransmit_addrs<'a>(
     cache: &HashMap<Slot, (/*leader:*/ Pubkey, Arc<ClusterNodes<RetransmitStage>>)>,
     addr_cache: &'a AddrCache,
     socket_addr_space: &SocketAddrSpace,
+    rtt: &solana_gossip::tvu_rtt::TvuRttCache,
     stats: &RetransmitStats,
 ) -> Option<(/*root_distance:*/ u8, Cow<'a, [SocketAddr]>)> {
     if let Some((root_distance, addrs)) = addr_cache.get(shred) {
@@ -542,7 +546,13 @@ fn get_retransmit_addrs<'a>(
     }
     let (slot_leader, cluster_nodes) = cache.get(&shred.slot())?;
     let (root_distance, addrs) = cluster_nodes
-        .get_retransmit_addrs(slot_leader, shred, DATA_PLANE_FANOUT, socket_addr_space)
+        .get_retransmit_addrs(
+            slot_leader,
+            shred,
+            DATA_PLANE_FANOUT,
+            socket_addr_space,
+            rtt,
+        )
         .inspect_err(|err| match err {
             Error::Loopback { .. } => {
                 stats.num_loopback_errs.fetch_add(1, Ordering::Relaxed);
@@ -588,10 +598,17 @@ fn cache_retransmit_addrs(
         return false;
     }
     let socket_addr_space = cluster_info.socket_addr_space();
+    let rtt = cluster_info.tvu_rtt_cache();
     let get_retransmit_addrs = |shred: ShredId| {
         let (slot_leader, cluster_nodes) = cache.get(&shred.slot())?;
         let (root_distance, addrs) = cluster_nodes
-            .get_retransmit_addrs(slot_leader, &shred, DATA_PLANE_FANOUT, socket_addr_space)
+            .get_retransmit_addrs(
+                slot_leader,
+                &shred,
+                DATA_PLANE_FANOUT,
+                socket_addr_space,
+                rtt,
+            )
             .ok()?;
         Some((shred, (root_distance, addrs.into_boxed_slice())))
     };

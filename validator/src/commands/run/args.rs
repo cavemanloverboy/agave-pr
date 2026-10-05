@@ -361,6 +361,29 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("tvu_relay_addr")
+            .long("tvu-relay-address")
+            .value_name("HOST:PORT")
+            .takes_value(true)
+            .multiple(true)
+            .validator(solana_net_utils::is_host_port)
+            .help(
+                "Extra TVU address for this node. Senders deliver shreds to the lowest-ping \
+                 address among the primary TVU and these relays. Repeat for each relay.",
+            ),
+    )
+    .arg(
+        Arg::with_name("tvu_relay_feed_addr")
+            .long("tvu-relay-feed-address")
+            .value_name("HOST:PORT")
+            .takes_value(true)
+            .validator(solana_net_utils::is_host_port)
+            .help(
+                "Serve leader schedule and turbine peer snapshots to agave-tvu-relay on this \
+                 TCP address",
+            ),
+    )
+    .arg(
         Arg::with_name("public_rpc_addr")
             .long("public-rpc-address")
             .value_name("HOST:PORT")

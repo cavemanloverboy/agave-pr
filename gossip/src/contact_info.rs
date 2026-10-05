@@ -55,6 +55,8 @@ impl<R, F: Fn(&ContactInfo) -> R> ContactInfoQuery<R> for F {}
 pub enum Error {
     #[error("Duplicate IP address: {0}")]
     DuplicateIpAddr(IpAddr),
+    #[error("Duplicate TVU relay: {0}")]
+    DuplicateTvuRelay(SocketAddr),
     #[error("Duplicate socket: {0}")]
     DuplicateSocket(/*key:*/ u8),
     #[error("Invalid IP address index: {index}, num addrs: {num_addrs}")]
@@ -75,6 +77,19 @@ pub enum Error {
     UnspecifiedIpAddr(IpAddr),
     #[error("Unused IP address: {0}")]
     UnusedIpAddr(IpAddr),
+    #[error("Too many TVU relays")]
+    TooManyTvuRelays,
+}
+
+/// Maximum number of extra TVU sockets a staked node may publish.
+///
+/// Relays are unstaked receive addresses that stand in for this node when a
+/// sender is closer to the relay than to the primary TVU.
+pub const MAX_TVU_RELAYS: usize = 4;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct TvuRelays {
+    pub(crate) addrs: Vec<SocketAddr>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -120,7 +135,9 @@ define_tlv_enum!(
     /// Always add new TLV records to the end of this enum.
     /// Never reorder or reuse a type.
     /// Ensure new type collisions do not happen.
-    pub(crate) enum Extension {}
+    pub(crate) enum Extension {
+        1 => TvuRelays(TvuRelays),
+    }
 );
 
 // As part of deserialization, self.addrs and self.sockets should be cross
@@ -291,6 +308,52 @@ impl ContactInfo {
     get_socket!(tpu_vote, SOCKET_TAG_TPU_VOTE, SOCKET_TAG_TPU_VOTE_QUIC);
     get_socket!(tvu, SOCKET_TAG_TVU, SOCKET_TAG_TVU_QUIC);
     get_socket!(alpenglow, SOCKET_TAG_ALPENGLOW);
+
+    /// Extra TVU sockets published for this staked node. Senders pick the
+    /// lowest-ping address among the primary TVU and these relays.
+    pub fn tvu_relays(&self) -> &[SocketAddr] {
+        self.extensions
+            .iter()
+            .find_map(|extension| match extension {
+                Extension::TvuRelays(relays) => Some(relays.addrs.as_slice()),
+            })
+            .unwrap_or(&[])
+    }
+
+    /// Primary UDP TVU followed by relay addresses, without duplicates.
+    pub fn tvu_destinations(&self) -> Vec<SocketAddr> {
+        let mut dests = Vec::with_capacity(1 + self.tvu_relays().len());
+        if let Some(tvu) = self.tvu(Protocol::UDP) {
+            dests.push(tvu);
+        }
+        for addr in self.tvu_relays() {
+            if !dests.contains(addr) {
+                dests.push(*addr);
+            }
+        }
+        dests
+    }
+
+    pub fn set_tvu_relays(&mut self, relays: &[SocketAddr]) -> Result<(), Error> {
+        if relays.len() > MAX_TVU_RELAYS {
+            return Err(Error::TooManyTvuRelays);
+        }
+        let mut seen = HashSet::with_capacity(relays.len());
+        for addr in relays {
+            sanitize_socket(addr)?;
+            if !seen.insert(*addr) {
+                return Err(Error::DuplicateTvuRelay(*addr));
+            }
+        }
+        self.extensions
+            .retain(|extension| !matches!(extension, Extension::TvuRelays(_)));
+        if !relays.is_empty() {
+            self.extensions.push(Extension::TvuRelays(TvuRelays {
+                addrs: relays.to_vec(),
+            }));
+        }
+        Ok(())
+    }
 
     set_socket!(set_gossip, SOCKET_TAG_GOSSIP);
     set_socket!(set_rpc, SOCKET_TAG_RPC);
@@ -576,7 +639,7 @@ impl TryFrom<ContactInfoLite> for ContactInfo {
             version,
             addrs,
             sockets,
-            extensions: tlv::parse(&extensions),
+            extensions: sanitize_extensions(tlv::parse(&extensions)),
             cache: EMPTY_SOCKET_ADDR_CACHE,
         };
         // Populate node.cache.
@@ -606,6 +669,23 @@ impl Sanitize for ContactInfo {
         }
         Ok(())
     }
+}
+
+fn sanitize_extensions(mut extensions: Vec<Extension>) -> Vec<Extension> {
+    extensions.retain(|extension| match extension {
+        Extension::TvuRelays(relays) => {
+            relays.addrs.len() <= MAX_TVU_RELAYS
+                && relays
+                    .addrs
+                    .iter()
+                    .all(|addr| sanitize_socket(addr).is_ok())
+                && {
+                    let mut seen = HashSet::with_capacity(relays.addrs.len());
+                    relays.addrs.iter().all(|addr| seen.insert(*addr))
+                }
+        }
+    });
+    extensions
 }
 
 pub(crate) fn sanitize_socket(socket: &SocketAddr) -> Result<(), Error> {
@@ -1092,5 +1172,28 @@ mod tests {
             assert_eq!(node.overrides(&other), Some(false));
             assert_eq!(other.overrides(&node), Some(true));
         }
+    }
+
+    #[test]
+    fn test_tvu_relays_roundtrip_and_legacy_skip() {
+        let mut node = ContactInfo::new(Keypair::new().pubkey(), 1, 2);
+        let primary = SocketAddr::from(([10, 0, 0, 1], 8001));
+        let relay = SocketAddr::from(([10, 0, 0, 2], 8001));
+        node.set_tvu(Protocol::UDP, primary).unwrap();
+        node.set_tvu_relays(&[relay]).unwrap();
+        assert_eq!(node.tvu_destinations(), vec![primary, relay]);
+
+        let bytes = bincode::serialize(&node).unwrap();
+        let decoded: ContactInfo = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.tvu(Protocol::UDP), Some(primary));
+        assert_eq!(decoded.tvu_relays(), &[relay]);
+
+        // A contact info with no relay extension still deserializes, and an
+        // unknown TLV record is skipped rather than failing the node.
+        node.set_tvu_relays(&[]).unwrap();
+        let legacy = bincode::serialize(&node).unwrap();
+        let decoded: ContactInfo = bincode::deserialize(&legacy).unwrap();
+        assert!(decoded.tvu_relays().is_empty());
+        assert_eq!(decoded.tvu_destinations(), vec![primary]);
     }
 }

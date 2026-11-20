@@ -19,6 +19,7 @@ rustdoc-args = ["--cfg=docsrs"]
 
 [features]
 agave-unstable-api = []
+j6 = ["dep:solana-sbpf", "solana-sbpf/j6"]
 
 [dependencies]
 agave-cpu-utils = { workspace = true }
@@ -82,6 +83,7 @@ solana-rpc = { workspace = true }
 solana-rpc-client = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-runtime = { workspace = true }
+solana-sbpf = { workspace = true, optional = true }
 solana-sdk-ids = { workspace = true }
 solana-send-transaction-service = { workspace = true }
 solana-signer = { workspace = true }

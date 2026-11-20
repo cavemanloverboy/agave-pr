@@ -1,0 +1,35 @@
+[package]
+name = "solana-sbpf"
+version = "0.28.0"
+description = "Selects the crates.io solana-sbpf 0.28.0 release or the J6 JIT build"
+license = "Apache-2.0"
+edition = "2021"
+
+[dependencies]
+solana-sbpf-prod = { path = "../solana-sbpf-prod", default-features = false }
+solana-sbpf-j6 = { path = "../solana-sbpf-j6", default-features = false, optional = true }
+
+[features]
+default = ["jit"]
+j6 = ["dep:solana-sbpf-j6"]
+jit = ["solana-sbpf-prod/jit", "solana-sbpf-j6?/jit"]
+jit-enable-host-stack-frames = [
+    "jit",
+    "solana-sbpf-prod/jit-enable-host-stack-frames",
+    "solana-sbpf-j6?/jit-enable-host-stack-frames",
+]
+fuzzer-not-safe-for-production = [
+    "solana-sbpf-prod/fuzzer-not-safe-for-production",
+    "solana-sbpf-j6?/fuzzer-not-safe-for-production",
+]
+tracer = ["solana-sbpf-prod/tracer", "solana-sbpf-j6?/tracer"]
+debugger = ["solana-sbpf-prod/debugger", "solana-sbpf-j6?/debugger"]
+shuttle-test = ["solana-sbpf-prod/shuttle-test", "solana-sbpf-j6?/shuttle-test"]
+conf-stack-frame-size = [
+    "solana-sbpf-prod/conf-stack-frame-size",
+    "solana-sbpf-j6?/conf-stack-frame-size",
+]
+dev-context-only-utils = [
+    "solana-sbpf-prod/dev-context-only-utils",
+    "solana-sbpf-j6?/dev-context-only-utils",
+]

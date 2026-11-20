@@ -1,0 +1,2698 @@
+//! This module defines memory regions
+
+use crate::{
+    aligned_memory::Pod,
+    ebpf,
+    error::{EbpfError, ProgramResult, StableResult},
+    program::SBPFVersion,
+    vm::{Config, ContextObject, EncryptedHostAddressToEbpfVm},
+};
+use std::fmt::Formatter;
+use std::{array, cell::UnsafeCell, fmt, marker::PhantomData, mem, ops::Range, ptr};
+
+/* Explanation of the Gapped Memory
+
+    The MemoryMapping supports a special mapping mode which is used for the stack MemoryRegion.
+    In this mode the backing address space of the host is sliced in power-of-two aligned frames.
+    The exponent of this alignment is specified in vm_gap_shift. Then the virtual address space
+    of the guest is spread out in a way which leaves gaps, the same size as the frames, in
+    between the frames. This effectively doubles the size of the guests virtual address space.
+    But the actual mapped memory stays the same, as the gaps are not mapped and accessing them
+    results in an AccessViolation.
+
+    Guest: frame 0 | gap 0 | frame 1 | gap 1 | frame 2 | gap 2 | ...
+              |                /                 /
+              |          *----*    *------------*
+              |         /         /
+    Host:  frame 0 | frame 1 | frame 2 | ...
+*/
+
+/// Callback executed before generate_access_violation()
+pub type AccessViolationHandler =
+    Box<dyn Fn(&mut dyn ContextObject, &mut MemoryRegion, u64, AccessType, u64, u64)>;
+/// Fail always
+#[allow(clippy::result_unit_err)]
+pub fn default_access_violation_handler(
+    _context_object: &mut dyn ContextObject,
+    _region: &mut MemoryRegion,
+    _region_max_len: u64,
+    _access_type: AccessType,
+    _vm_addr: u64,
+    _len: u64,
+) {
+}
+
+/// Types that can be used as backing memory for memory mappings.
+///
+/// ## Safety
+///
+/// The implementers must ensure that the returned address and byte length are contained by the
+/// implementing type's objects.
+pub unsafe trait HostMemoryObject {
+    /// The provenance-exposed address in the host address space for this object.
+    ///
+    /// Normally this is just an address of the pointer.
+    fn host(self) -> HostBuffer;
+}
+
+/// Types that can be directly mapped into VM memory space should implement this trait.
+///
+/// The blanket implementations of [`HostMemoryObject`] for `*const T` where `T: VmExposable` allow
+/// exposing the implementing types to the guests directly.
+pub trait VmExposable {}
+
+/// Types that can be directly and mutably mapped into VM memory space.
+///
+/// The blanket implementations of [`HostMemoryObject`] for `*mut T` where `T: VmExposableMut` allow
+/// mutably exposing the implementing types to the guests directly.
+///
+/// ## Safety
+///
+/// The type must not have any invariants that could be broken by the guest's modifications to the
+/// data within objects of this type.
+pub unsafe trait VmExposableMut {}
+
+unsafe impl VmExposableMut for u8 {}
+impl<T: VmExposableMut> VmExposable for T {}
+
+unsafe impl<T: VmExposable> HostMemoryObject for *const T {
+    fn host(self) -> HostBuffer {
+        HostBuffer::Immutable(ptr::slice_from_raw_parts(
+            self.cast(),
+            std::mem::size_of::<T>(),
+        ))
+    }
+}
+
+unsafe impl<T: VmExposableMut> HostMemoryObject for *mut T {
+    fn host(self) -> HostBuffer {
+        HostBuffer::Mutable(ptr::slice_from_raw_parts_mut(
+            self.cast(),
+            std::mem::size_of::<T>(),
+        ))
+    }
+}
+
+unsafe impl<T: VmExposable> HostMemoryObject for *const [T] {
+    fn host(self) -> HostBuffer {
+        HostBuffer::Immutable(ptr::slice_from_raw_parts(
+            self.cast(),
+            self.len().checked_mul(core::mem::size_of::<T>()).unwrap(),
+        ))
+    }
+}
+
+unsafe impl<T: VmExposableMut> HostMemoryObject for *mut [T] {
+    fn host(self) -> HostBuffer {
+        HostBuffer::Mutable(ptr::slice_from_raw_parts_mut(
+            self.cast(),
+            self.len().checked_mul(core::mem::size_of::<T>()).unwrap(),
+        ))
+    }
+}
+
+unsafe impl<T: VmExposable, const N: usize> HostMemoryObject for *const [T; N] {
+    fn host(self) -> HostBuffer {
+        HostBuffer::Immutable(ptr::slice_from_raw_parts(
+            self.cast(),
+            N.checked_mul(core::mem::size_of::<T>()).unwrap(),
+        ))
+    }
+}
+
+unsafe impl<T: VmExposableMut, const N: usize> HostMemoryObject for *mut [T; N] {
+    fn host(self) -> HostBuffer {
+        HostBuffer::Mutable(ptr::slice_from_raw_parts_mut(
+            self.cast(),
+            N.checked_mul(core::mem::size_of::<T>()).unwrap(),
+        ))
+    }
+}
+
+/// Either mutable or immutable slice, returned by [`MemoryRegion::host_buffer`].
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
+pub enum HostBuffer {
+    /// The `MemoryRegion` is read-only.
+    Immutable(*const [u8]),
+    /// The `MemoryRegion` is writable (`AccessType::Store` is permitted.)
+    Mutable(*mut [u8]),
+}
+
+impl HostBuffer {
+    /// The length of this host buffer.
+    pub fn len(&self) -> usize {
+        match self {
+            HostBuffer::Immutable(p) => p.len(),
+            HostBuffer::Mutable(p) => p.len(),
+        }
+    }
+
+    /// `true` if this host buffer has a length of 0.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            HostBuffer::Immutable(p) => p.is_empty(),
+            HostBuffer::Mutable(p) => p.is_empty(),
+        }
+    }
+
+    /// `true` if this is a `HostBuffer::Mutable`.
+    pub fn is_mutable(&self) -> bool {
+        matches!(self, HostBuffer::Mutable(_))
+    }
+
+    /// Make this host buffer mutable.
+    ///
+    /// # Safety
+    ///
+    /// This host buffer *must* have been initially constructed with a mutable pointer.
+    pub unsafe fn mutable(self) -> Self {
+        match self {
+            HostBuffer::Immutable(p) => HostBuffer::Mutable(p.cast_mut()),
+            HostBuffer::Mutable(_) => self,
+        }
+    }
+
+    /// Make this host buffer immutable.
+    pub fn immutable(self) -> Self {
+        match self {
+            HostBuffer::Immutable(_) => self,
+            HostBuffer::Mutable(p) => Self::Immutable(p.cast_const()),
+        }
+    }
+
+    /// Subslice this host buffer with the provided range.
+    #[inline]
+    pub fn get(self, range: std::ops::Range<usize>) -> Option<Self> {
+        if range.end > self.len() {
+            return None;
+        }
+        let new_len = range.len();
+        unsafe {
+            // SAFETY:
+            //
+            // Contract from `ptr::add`: If the computed offset is non-zero, then self
+            // must be derived from a pointer to some allocation, and the entire memory
+            // range between self and the result must be in bounds of that allocation.
+            // In particular, this range must not "wrap around" the edge of the address
+            // space.
+            //
+            // Evidence: We take care to ensure to only get here if the `begin_offset`
+            // (and a stronger condition: `begin_offset + len`) would be within `len()`
+            // of the base pointer.
+            //
+            // Contract from `ptr::add`: The offset in bytes, count * size_of::<T>(),
+            // computed on mathematical integers (without "wrapping around"), must fit
+            // in an isize.
+            //
+            // Evidence: Allocation size in Rust, including those of the region backing
+            // memory here specifically, may not exceed `isize::MAX` bytes.
+            Some(match self {
+                HostBuffer::Immutable(p) => HostBuffer::Immutable(ptr::slice_from_raw_parts(
+                    p.byte_add(range.start).cast(),
+                    new_len,
+                )),
+                HostBuffer::Mutable(p) => HostBuffer::Mutable(ptr::slice_from_raw_parts_mut(
+                    p.byte_add(range.start).cast(),
+                    new_len,
+                )),
+            })
+        }
+    }
+
+    /// Pointer to a slice of the host memory.
+    #[inline(always)]
+    pub fn ptr(self) -> *const [u8] {
+        match self {
+            HostBuffer::Immutable(p) => p,
+            HostBuffer::Mutable(p) => p,
+        }
+    }
+
+    /// Mutble pointer to a slice of the host memory.
+    #[inline(always)]
+    pub fn ptr_mut(self) -> *mut [u8] {
+        match self {
+            HostBuffer::Immutable(p) => {
+                debug_assert!(false, "ptr_mut, but buffer is immutable");
+                p.cast_mut()
+            }
+            HostBuffer::Mutable(p) => p,
+        }
+    }
+}
+
+unsafe impl HostMemoryObject for HostBuffer {
+    fn host(self) -> HostBuffer {
+        self
+    }
+}
+
+#[inline(always)]
+fn split_host_buffer(host: HostBuffer) -> (u64, u64, u8) {
+    match host {
+        HostBuffer::Immutable(p) => (p.cast::<u8>().expose_provenance() as u64, p.len() as u64, 0),
+        HostBuffer::Mutable(p) => (p.cast::<u8>().expose_provenance() as u64, p.len() as u64, 1),
+    }
+}
+
+/// Memory region for bounds checking and address translation
+#[derive(Eq, PartialEq, Clone)]
+#[repr(C)]
+pub struct MemoryRegion {
+    host_addr: u64,
+    /// start virtual address
+    vm_addr: u64,
+    /// Length in bytes
+    len: u64,
+    /// Size of regular gaps as bit shift (63 means this region is continuous)
+    vm_gap_shift: u8,
+    /// `1` for `HostBuffer::Mutable`, `0` for `HostBuffer::Immutable`
+    writable: u8,
+    /// User defined payload for the [AccessViolationHandler]
+    pub access_violation_handler_payload: Option<u16>,
+    _marker: PhantomData<*mut [u8]>,
+}
+
+#[allow(dead_code)]
+impl MemoryRegion {
+    pub(crate) const HOST_ADDR_OFFSET: usize = mem::offset_of!(Self, host_addr);
+    pub(crate) const VM_ADDR_OFFSET: usize = mem::offset_of!(Self, vm_addr);
+    pub(crate) const LEN_OFFSET: usize = mem::offset_of!(Self, len);
+    pub(crate) const VM_GAP_SHIFT_OFFSET: usize = mem::offset_of!(Self, vm_gap_shift);
+    pub(crate) const WRITABLE_OFFSET: usize = mem::offset_of!(Self, writable);
+    pub(crate) const SIZE: usize = mem::size_of::<Self>();
+    pub(crate) const SIZE_SHIFT: u8 = 5;
+
+    const _LAYOUT_ASSERTS: () = {
+        assert!(Self::SIZE == 32);
+        assert!(Self::SIZE == 1 << Self::SIZE_SHIFT);
+        assert!(Self::HOST_ADDR_OFFSET == 0);
+        assert!(Self::VM_ADDR_OFFSET == 8);
+        assert!(Self::LEN_OFFSET == 16);
+        assert!(Self::VM_GAP_SHIFT_OFFSET == 24);
+        assert!(Self::WRITABLE_OFFSET == 25);
+    };
+
+    /// Create a VM memory region with host `address` pointing to a `len` bytes of data.
+    ///
+    /// This region will be made available in the guest at `vm_addr`.
+    fn new_internal(host: HostBuffer, vm_addr: u64, vm_gap_size: u64) -> Self {
+        let mut vm_gap_shift = (std::mem::size_of::<u64>() as u8)
+            .saturating_mul(8)
+            .saturating_sub(1);
+        if vm_gap_size > 0 {
+            vm_gap_shift = vm_gap_shift.saturating_sub(vm_gap_size.leading_zeros() as u8);
+            debug_assert_eq!(Some(vm_gap_size), 1_u64.checked_shl(vm_gap_shift as u32));
+        };
+        let (host_addr, len, writable) = split_host_buffer(host);
+        MemoryRegion {
+            host_addr,
+            vm_addr,
+            len,
+            vm_gap_shift,
+            writable,
+            access_violation_handler_payload: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Creates a new, empty `MemoryRegion`.
+    ///
+    /// This does not require to provide any backing host memory.
+    pub fn new_empty(vm_addr: u64) -> Self {
+        const EMPTY: &[u8] = &[];
+        Self::new_internal((&raw const *EMPTY).host(), vm_addr, 0)
+    }
+
+    /// Creates a new `MemoryRegion` backed by the provided host memory.
+    ///
+    /// The backing memory must remain allocated for the duration of the returned `MemoryRegion`.
+    pub fn new<HO: HostMemoryObject>(host: HO, vm_addr: u64) -> Self {
+        Self::new_internal(host.host(), vm_addr, 0)
+    }
+
+    /// Creates a new gapped `MemoryRegion` backed by the provided host memory.
+    ///
+    /// The backing memory must remain allocated for the duration of the returned `MemoryRegion`.
+    pub fn new_gapped<HO: HostMemoryObject>(host: HO, vm_addr: u64, vm_gap_size: u64) -> Self {
+        Self::new_internal(host.host(), vm_addr, vm_gap_size)
+    }
+
+    /// Redirect this memory region to a different location in host memory.
+    ///
+    /// Depending on whether `HO` is mutable, the writability of the region is adjusted as well.
+    ///
+    /// # Safety
+    ///
+    /// If this `MemoryRegion` is a part of a [`MemoryMapping`] then, after redirection, this region
+    /// must adhere to all the same contracts as the `MemoryRegion`s used for
+    /// [`MemoryMapping::replace_region`].
+    pub unsafe fn redirect<HO: HostMemoryObject>(&mut self, host: HO) {
+        let (host_addr, len, writable) = split_host_buffer(host.host());
+        self.host_addr = host_addr;
+        self.len = len;
+        self.writable = writable;
+    }
+
+    /// Ensure that this memory region is immutable.
+    pub fn make_immutable(&mut self) {
+        self.writable = 0;
+    }
+
+    /// Returns the vm address space covered by this MemoryRegion
+    pub fn vm_addr_range(&self) -> Range<u64> {
+        let bytes = self.len;
+        if self.vm_gap_shift == 63 {
+            self.vm_addr..self.vm_addr.saturating_add(bytes)
+        } else {
+            self.vm_addr..self.vm_addr.saturating_add(bytes.saturating_mul(2))
+        }
+    }
+
+    /// Return the raw slice to the host memory that this memory region points at.
+    ///
+    /// This can be used to construct a new memory region.
+    #[inline(always)]
+    pub fn host_buffer(&self) -> HostBuffer {
+        if self.writable != 0 {
+            HostBuffer::Mutable(ptr::slice_from_raw_parts_mut(
+                ptr::with_exposed_provenance_mut(self.host_addr as usize),
+                self.len as usize,
+            ))
+        } else {
+            HostBuffer::Immutable(ptr::slice_from_raw_parts(
+                ptr::with_exposed_provenance(self.host_addr as usize),
+                self.len as usize,
+            ))
+        }
+    }
+
+    /// Length of this memory region in bytes.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Is the length of this memory region 0 bytes?
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Return the `gap_size` with which the memory region has been constructed.
+    pub fn gap_size(&self) -> u64 {
+        if self.vm_gap_shift == 63 {
+            0
+        } else {
+            1 << self.vm_gap_shift
+        }
+    }
+
+    /// Convert a virtual machine address into a host slice.
+    ///
+    /// The returned slice will have exactly `len` bytes. If the provided `vm_addr` does not
+    /// correlate to a valid subslice of this region, a `None` will be returned.
+    #[inline]
+    pub(crate) fn vm_to_host_buffer(&self, vm_addr: u64, len: u64) -> Option<HostBuffer> {
+        // This can happen if a region starts at an offset from the base region
+        // address, eg with rodata regions if config.optimize_rodata = true, see
+        // Elf::get_ro_region.
+        if vm_addr < self.vm_addr {
+            return None;
+        }
+
+        let begin_offset = vm_addr.saturating_sub(self.vm_addr);
+        if self.vm_gap_shift == 63 {
+            // fast path for non-gapped regions
+            if let Some(end_offset) = begin_offset.checked_add(len) {
+                return self
+                    .host_buffer()
+                    .get(begin_offset as usize..end_offset as usize);
+            }
+            return None;
+        }
+
+        let is_in_gap = (begin_offset
+            .checked_shr(self.vm_gap_shift as u32)
+            .unwrap_or(0)
+            & 1)
+            == 1;
+        let gap_mask = (-1i64).checked_shl(self.vm_gap_shift as u32).unwrap_or(0) as u64;
+        let gapped_offset =
+            (begin_offset & gap_mask).checked_shr(1).unwrap_or(0) | (begin_offset & !gap_mask);
+        if let Some(end_offset) = gapped_offset.checked_add(len) {
+            if !is_in_gap {
+                return self
+                    .host_buffer()
+                    .get(gapped_offset as usize..end_offset as usize);
+            }
+        }
+        None
+    }
+}
+
+impl fmt::Debug for MemoryRegion {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let vm_addr = self.vm_addr_range();
+        let host_addr = self.host_addr;
+        let len = self.len;
+        let writable = self.writable != 0;
+        write!(
+            f,
+            "host_addr: {:#x?}-{:#x?}, vm_addr: {:#x?}-{:#x?}, len: {}, writable: {}, payload {:?}",
+            host_addr,
+            host_addr.saturating_add(len),
+            vm_addr.start,
+            vm_addr.end,
+            len,
+            writable,
+            self.access_violation_handler_payload,
+        )
+    }
+}
+
+impl std::cmp::PartialOrd for MemoryRegion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::cmp::Ord for MemoryRegion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.vm_addr.cmp(&other.vm_addr)
+    }
+}
+
+/// Type of memory access
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AccessType {
+    /// Read
+    Load,
+    /// Write
+    Store,
+}
+
+impl std::fmt::Display for AccessType {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Load => "reading",
+            Self::Store => "writing",
+        })
+    }
+}
+
+/// Owned slice of [`MemoryRegion`]s with a predictable `#[repr(C)]` `(ptr, len)` layout.
+#[repr(C)]
+pub(crate) struct RegionSlice {
+    pub(crate) ptr: *mut MemoryRegion,
+    pub(crate) len: usize,
+}
+
+impl RegionSlice {
+    fn from_vec(regions: Vec<MemoryRegion>) -> Self {
+        let boxed = regions.into_boxed_slice();
+        let len = boxed.len();
+        let ptr = Box::into_raw(boxed).cast::<MemoryRegion>();
+        Self { ptr, len }
+    }
+
+    fn take_vec(&mut self) -> Vec<MemoryRegion> {
+        let slice = ptr::slice_from_raw_parts_mut(
+            mem::replace(&mut self.ptr, ptr::NonNull::dangling().as_ptr()),
+            mem::replace(&mut self.len, 0),
+        );
+        unsafe { Box::from_raw(slice) }.into_vec()
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[MemoryRegion] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    #[inline(always)]
+    fn as_mut_slice(&mut self) -> &mut [MemoryRegion] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl std::ops::Deref for RegionSlice {
+    type Target = [MemoryRegion];
+
+    #[inline(always)]
+    fn deref(&self) -> &[MemoryRegion] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for RegionSlice {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [MemoryRegion] {
+        self.as_mut_slice()
+    }
+}
+
+impl Drop for RegionSlice {
+    fn drop(&mut self) {
+        let slice = ptr::slice_from_raw_parts_mut(self.ptr, self.len);
+        unsafe {
+            drop(Box::from_raw(slice));
+        }
+    }
+}
+
+impl fmt::Debug for RegionSlice {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
+
+/// Memory mapping based on eytzinger search.
+#[repr(C)]
+pub struct UnalignedMemoryMapping {
+    /// Common parts
+    regions: RegionSlice,
+    /// Cache of the last `MappingCache::SIZE` vm_addr => region_index lookups
+    cache: UnsafeCell<MappingCache>,
+    /// Regions vm_addr fields in Eytzinger order
+    region_addresses: Box<[u64]>,
+    /// Converts the Eytzinger order back to the original order
+    region_index_lookup: Box<[usize]>,
+}
+
+impl fmt::Debug for UnalignedMemoryMapping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnalignedMemoryMapping")
+            .field("regions", &self.regions)
+            .field("cache", &self.cache)
+            .finish()
+    }
+}
+
+impl UnalignedMemoryMapping {
+    fn construct_eytzinger_order(&mut self, mut in_index: usize, out_index: usize) -> usize {
+        if out_index >= self.regions.len() {
+            return in_index;
+        }
+        in_index =
+            self.construct_eytzinger_order(in_index, out_index.saturating_mul(2).saturating_add(1));
+        self.region_addresses[out_index] = self.regions[in_index].vm_addr;
+        self.region_index_lookup[out_index] = in_index;
+        self.construct_eytzinger_order(
+            in_index.saturating_add(1),
+            out_index.saturating_mul(2).saturating_add(2),
+        )
+    }
+
+    /// Create an uninitialized UnalignedMapping
+    ///
+    /// # Safety
+    ///
+    /// Refer to [`MemoryMapping::new_uninitialized`].
+    pub unsafe fn new_uninitialized(regions: Vec<MemoryRegion>) -> Self {
+        let number_of_regions = regions.len();
+        Self {
+            regions: RegionSlice::from_vec(regions),
+            cache: UnsafeCell::new(MappingCache::new()),
+            region_addresses: vec![0; number_of_regions].into_boxed_slice(),
+            region_index_lookup: vec![0; number_of_regions].into_boxed_slice(),
+        }
+    }
+
+    /// Creates a new MemoryMapping structure from the given regions
+    ///
+    /// # Safety
+    ///
+    /// Refer to [`MemoryMapping::new_uninitialized`].
+    pub unsafe fn new(regions: Vec<MemoryRegion>) -> Result<Self, EbpfError> {
+        let mut mapping = Self::new_uninitialized(regions);
+        mapping.initialize()?;
+        Ok(mapping)
+    }
+
+    /// Initialize the memory mapping
+    pub fn initialize(&mut self) -> Result<(), EbpfError> {
+        self.cache.get_mut().flush();
+        self.regions.sort();
+        let number_of_regions = self.regions.len();
+        for index in 1..number_of_regions {
+            let first = &self.regions[index.saturating_sub(1)];
+            let second = &self.regions[index];
+            if first.vm_addr_range().end > second.vm_addr {
+                return Err(EbpfError::InvalidMemoryRegion(index));
+            }
+        }
+
+        self.construct_eytzinger_order(0, 0);
+        Ok(())
+    }
+
+    /// Returns the `MemoryRegion` which may contain the given address.
+    #[allow(clippy::arithmetic_side_effects)]
+    #[inline(always)]
+    pub fn find_region(&self, vm_addr: u64) -> Option<(usize, &MemoryRegion)> {
+        // Safety:
+        // &mut references to the mapping cache are only created internally from methods that do not
+        // invoke each other. UnalignedMemoryMapping is !Sync, so the cache reference below is
+        // guaranteed to be unique.
+        let cache = unsafe { &mut *self.cache.get() };
+        if let Some(index) = cache.find(vm_addr) {
+            // Safety:
+            // Cached index, we validated it before caching it. See the corresponding safety section
+            // in the miss branch.
+            Some((index, unsafe { self.regions.get_unchecked(index) }))
+        } else {
+            let mut index = 1;
+            while index <= self.region_addresses.len() {
+                // Safety:
+                // we start the search at index=1 and in the loop condition check
+                // for index <= len, so bound checks can be avoided
+                index = (index << 1)
+                    + unsafe { *self.region_addresses.get_unchecked(index - 1) <= vm_addr }
+                        as usize;
+            }
+            index >>= index.trailing_zeros() + 1;
+            if index == 0 {
+                return None;
+            }
+            // Safety:
+            // we check for index==0 above, and by construction if we get here index
+            // must be contained in region
+            index = unsafe { *self.region_index_lookup.get_unchecked(index - 1) };
+            let region = unsafe { self.regions.get_unchecked(index) };
+            cache.insert(region.vm_addr_range(), index);
+            Some((index, region))
+        }
+    }
+
+    /// Replaces the `MemoryRegion` at the given index
+    ///
+    /// # Safety
+    ///
+    /// Refer to [`MemoryMapping::new_uninitialized`].
+    #[inline(always)]
+    pub unsafe fn replace_region(
+        &mut self,
+        index: usize,
+        region: MemoryRegion,
+    ) -> Result<(), EbpfError> {
+        self.regions[index] = region;
+        self.cache.get_mut().flush();
+        Ok(())
+    }
+}
+
+/// Memory mapping that uses the upper half of an address to identify the
+/// underlying memory region.
+#[derive(Debug)]
+#[repr(C)]
+pub struct AlignedMemoryMapping {
+    regions: RegionSlice,
+    virtual_address_bits: u32,
+}
+
+impl AlignedMemoryMapping {
+    /// Creates a new initialized MemoryMapping structure from the given regions
+    ///
+    /// # Safety
+    ///
+    /// Refer to [`MemoryMapping::new_uninitialized`].
+    pub unsafe fn new(regions: Vec<MemoryRegion>, region_size: usize) -> Result<Self, EbpfError> {
+        let mut mapping = Self::new_uninitialized(regions, region_size);
+        mapping.initialize()?;
+        Ok(mapping)
+    }
+
+    /// Create an uninitialized MemoryMapping
+    ///
+    /// # Safety
+    ///
+    /// Refer to [`MemoryMapping::new_uninitialized`].
+    pub unsafe fn new_uninitialized(regions: Vec<MemoryRegion>, region_size: usize) -> Self {
+        debug_assert!(region_size.is_multiple_of(2));
+        let virtual_address_bits = region_size.trailing_zeros();
+        Self {
+            regions: RegionSlice::from_vec(regions),
+            virtual_address_bits,
+        }
+    }
+
+    /// Initialize the memory mapping by sorting its regions and filling gaps
+    pub fn initialize(&mut self) -> Result<(), EbpfError> {
+        static EMPTY_SLICE: &[u8] = &[];
+        let mut regions = self.regions.take_vec();
+        regions.sort();
+        let mut expected_region_index = 0;
+        while expected_region_index < regions.len() {
+            let actual_region_index = regions
+                .get(expected_region_index)
+                .unwrap()
+                .vm_addr
+                .checked_shr(self.virtual_address_bits)
+                .unwrap_or(0) as usize;
+            if actual_region_index > expected_region_index {
+                regions.insert(
+                    expected_region_index,
+                    MemoryRegion::new(
+                        &raw const *EMPTY_SLICE,
+                        (expected_region_index as u64)
+                            .checked_shl(self.virtual_address_bits)
+                            .unwrap_or(u64::MAX),
+                    ),
+                );
+            } else if actual_region_index < expected_region_index {
+                self.regions = RegionSlice::from_vec(regions);
+                return Err(EbpfError::InvalidMemoryRegion(actual_region_index));
+            }
+            expected_region_index = expected_region_index.saturating_add(1);
+        }
+        self.regions = RegionSlice::from_vec(regions);
+        Ok(())
+    }
+
+    /// Returns the `MemoryRegion` which may contain the given address.
+    #[inline(always)]
+    pub fn find_region(&self, vm_addr: u64) -> Option<(usize, &MemoryRegion)> {
+        let index = vm_addr.wrapping_shr(self.virtual_address_bits) as usize;
+        if index < self.regions.len() {
+            // Safety: bounds check above
+            let region = unsafe { self.regions.get_unchecked(index) };
+            return Some((index, region));
+        }
+        None
+    }
+
+    /// Replaces the `MemoryRegion` at the given index
+    ///
+    /// # Safety
+    ///
+    /// Refer to [`MemoryMapping::new_uninitialized`].
+    #[inline(always)]
+    pub unsafe fn replace_region(
+        &mut self,
+        index: usize,
+        region: MemoryRegion,
+    ) -> Result<(), EbpfError> {
+        let begin_index = region
+            .vm_addr
+            .checked_shr(self.virtual_address_bits)
+            .unwrap_or(0) as usize;
+        let end_index = region
+            .vm_addr
+            .saturating_add((region.len() as u64).saturating_sub(1))
+            .checked_shr(self.virtual_address_bits)
+            .unwrap_or(0) as usize;
+        if begin_index != index || end_index != index {
+            return Err(EbpfError::InvalidMemoryRegion(index));
+        }
+        self.regions[index] = region;
+        Ok(())
+    }
+}
+
+/// Common parts of [UnalignedMemoryMapping] and [AlignedMemoryMapping]
+#[repr(C)]
+pub struct MemoryMapping {
+    ty: MemoryMappingType,
+    has_gapped_region: bool,
+    initialized: bool,
+    /// Executable sbpf_version
+    sbpf_version: SBPFVersion,
+    max_call_depth: i64,
+    stack_frame_size: i64,
+    /// Access violation handler
+    access_violation_handler: AccessViolationHandler,
+}
+
+impl fmt::Debug for MemoryMapping {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemoryMapping")
+            .field("max_call_depth", &self.max_call_depth)
+            .field("stack_frame_size", &self.stack_frame_size)
+            .field("sbpf_version", &self.sbpf_version)
+            .field("ty", &self.ty)
+            .finish()
+    }
+}
+
+/// Maps virtual memory to host memory.
+#[derive(Debug)]
+#[repr(C, u8)]
+pub enum MemoryMappingType {
+    /// Aligned memory mapping which uses the upper half of an address to
+    /// identify the underlying memory region.
+    Aligned(AlignedMemoryMapping) = 0,
+    /// Memory mapping that allows mapping unaligned memory regions.
+    Unaligned(UnalignedMemoryMapping) = 1,
+}
+
+#[allow(dead_code)]
+impl MemoryMapping {
+    pub(crate) const TAG_OFFSET: usize = mem::offset_of!(Self, ty);
+    pub(crate) const PAYLOAD_OFFSET: usize =
+        Self::TAG_OFFSET.saturating_add(mem::align_of::<RegionSlice>());
+    pub(crate) const REGIONS_PTR_OFFSET: usize = Self::PAYLOAD_OFFSET
+        .saturating_add(mem::offset_of!(AlignedMemoryMapping, regions))
+        .saturating_add(mem::offset_of!(RegionSlice, ptr));
+    pub(crate) const REGIONS_LEN_OFFSET: usize = Self::PAYLOAD_OFFSET
+        .saturating_add(mem::offset_of!(AlignedMemoryMapping, regions))
+        .saturating_add(mem::offset_of!(RegionSlice, len));
+    pub(crate) const ALIGNED_VA_BITS_OFFSET: usize = Self::PAYLOAD_OFFSET
+        .saturating_add(mem::offset_of!(AlignedMemoryMapping, virtual_address_bits));
+    pub(crate) const UNALIGNED_CACHE_ENTRIES_OFFSET: usize = Self::PAYLOAD_OFFSET
+        .saturating_add(mem::offset_of!(UnalignedMemoryMapping, cache))
+        .saturating_add(mem::offset_of!(MappingCache, entries));
+
+    const _LAYOUT_ASSERTS: () = {
+        assert!(Self::TAG_OFFSET == 0);
+        assert!(Self::PAYLOAD_OFFSET == 8);
+        assert!(Self::REGIONS_PTR_OFFSET == 8);
+        assert!(Self::REGIONS_LEN_OFFSET == 16);
+        assert!(
+            Self::PAYLOAD_OFFSET
+                .saturating_add(mem::offset_of!(UnalignedMemoryMapping, regions))
+                .saturating_add(mem::offset_of!(RegionSlice, ptr))
+                == Self::REGIONS_PTR_OFFSET
+        );
+        assert!(
+            Self::PAYLOAD_OFFSET
+                .saturating_add(mem::offset_of!(UnalignedMemoryMapping, regions))
+                .saturating_add(mem::offset_of!(RegionSlice, len))
+                == Self::REGIONS_LEN_OFFSET
+        );
+        assert!(Self::ALIGNED_VA_BITS_OFFSET == 24);
+        assert!(Self::UNALIGNED_CACHE_ENTRIES_OFFSET == 24);
+    };
+
+    /// Creates a new memory mapping.
+    ///
+    /// Uses aligned or unaligned memory mapping depending on the value of
+    /// `config.aligned_memory_mapping=true`.
+    ///
+    /// # Safety
+    ///
+    /// In addition to the requirements of [`MemoryMapping::new_uninitialized`], the provided
+    /// `access_violation_handler` must return with its [`MemoryRegion`] unmodified, or initialized
+    /// to another equally correct [`MemoryRegion`] as described in the safety invariants for
+    /// `new_uninitialized`.
+    pub unsafe fn new_with_access_violation_handler(
+        regions: Vec<MemoryRegion>,
+        config: &Config,
+        sbpf_version: SBPFVersion,
+        access_violation_handler: AccessViolationHandler,
+    ) -> Result<Self, EbpfError> {
+        let mut mapping =
+            Self::new_uninitialized(regions, config, sbpf_version, access_violation_handler);
+        mapping.initialize()?;
+        Ok(mapping)
+    }
+
+    /// Creates an unitialized memory mapping
+    ///
+    /// # Safety
+    ///
+    /// The memory pointed to by the [`MemoryRegion`]s must point to a valid object live for the
+    /// duration of this `MemoryMapping`.
+    ///
+    /// For `MemoryRegion`s marked writable, the memory pointed to by the memory region must accept
+    /// arbitrary bytes being overwritten without it resulting in unsoundness (due to e.g. broken
+    /// internal type invariants.)
+    pub unsafe fn new_uninitialized(
+        regions: Vec<MemoryRegion>,
+        config: &Config,
+        sbpf_version: SBPFVersion,
+        access_violation_handler: AccessViolationHandler,
+    ) -> Self {
+        let ty = if sbpf_version >= SBPFVersion::V4 || config.aligned_memory_mapping {
+            MemoryMappingType::Aligned(AlignedMemoryMapping::new_uninitialized(
+                regions,
+                config.aligned_region_size,
+            ))
+        } else {
+            debug_assert!(
+                sbpf_version <= SBPFVersion::V3,
+                "SBPFv4 and later versions do not support unaligned memory"
+            );
+            MemoryMappingType::Unaligned(UnalignedMemoryMapping::new_uninitialized(regions))
+        };
+
+        Self {
+            ty,
+            has_gapped_region: false,
+            initialized: false,
+            sbpf_version,
+            max_call_depth: config.max_call_depth as i64,
+            stack_frame_size: config.stack_frame_size as i64,
+            access_violation_handler: Box::new(access_violation_handler),
+        }
+    }
+
+    /// Creates a new memory mapping for tests and benches.
+    ///
+    /// `access_violation_handler` defaults to a function which always returns an error.
+    ///
+    /// # Safety
+    ///
+    /// Refer to [`MemoryMapping::new_uninitialized`].
+    pub unsafe fn new(
+        regions: Vec<MemoryRegion>,
+        config: &Config,
+        sbpf_version: SBPFVersion,
+    ) -> Result<Self, EbpfError> {
+        Self::new_with_access_violation_handler(
+            regions,
+            config,
+            sbpf_version,
+            Box::new(default_access_violation_handler),
+        )
+    }
+
+    /// Map virtual memory to host memory.
+    #[inline(always)]
+    pub fn map(
+        &self,
+        access_type: AccessType,
+        vm_addr: u64,
+        len: u64,
+    ) -> StableResult<HostBuffer, EbpfError> {
+        match self.map_fast(access_type, vm_addr, len) {
+            Some(host_buffer) => StableResult::Ok(host_buffer),
+            None => StableResult::Err(self.map_error(access_type, vm_addr, len)),
+        }
+    }
+
+    /// The error for why previous [`MemoryMapping::map_fast`] call returned `None` with the
+    /// provided arguments.
+    #[cold]
+    fn map_error(&self, access_type: AccessType, vm_addr: u64, len: u64) -> EbpfError {
+        let region = self.find_region(vm_addr).map(|(_index, region)| region);
+        self.generate_access_violation_for(region, access_type, vm_addr, len)
+    }
+
+    /// Same as [`MemoryMapping::map`], with simpler ABI.
+    #[inline(always)]
+    fn map_fast(&self, access_type: AccessType, vm_addr: u64, len: u64) -> Option<HostBuffer> {
+        debug_assert!(self.initialized);
+        match self.find_region(vm_addr).map(|(_index, region)| region) {
+            Some(region)
+                if region.host_buffer().is_mutable() || access_type != AccessType::Store =>
+            {
+                region.vm_to_host_buffer(vm_addr, len)
+            }
+            _ => None,
+        }
+    }
+
+    /// Loads `size_of::<T>()` bytes at the given guest address without invoking the
+    /// access_violation_handler.
+    ///
+    /// Returns `None` if the access is not allowed. [`Self::load_second_attempt`] may still succeed
+    /// and will return an appropriate error for the guest.
+    #[inline]
+    pub fn load_first_attempt<T: Pod + Into<u64>>(&mut self, vm_addr: u64) -> Option<u64> {
+        let len = mem::size_of::<T>() as u64;
+        debug_assert!(len <= mem::size_of::<u64>() as u64);
+        let buf = self.map_fast(AccessType::Load, vm_addr, len)?;
+        Some(unsafe { ptr::read_unaligned::<T>(buf.ptr().cast()) }.into())
+    }
+
+    /// Stores `value` at the given guest address without invoking the access_violation_handler.
+    ///
+    /// Returns `true` if store succeeded. [`Self::store_second_attempt`] may still succeed even if
+    /// `false` is returned.
+    #[inline]
+    pub fn store_first_attempt<T: Pod>(&mut self, value: T, vm_addr: u64) -> bool {
+        let len = mem::size_of::<T>() as u64;
+        debug_assert!(len <= mem::size_of::<u64>() as u64);
+        let Some(buf) = self.map_fast(AccessType::Store, vm_addr, len) else {
+            return false;
+        };
+        unsafe { ptr::write_unaligned::<T>(buf.ptr_mut().cast(), value) };
+        true
+    }
+
+    /// Invokes access_violation_handler then loads `size_of::<T>()` bytes at the given guest address.
+    #[cold]
+    #[inline(never)]
+    pub fn load_second_attempt<T: Pod + Into<u64>, C: ContextObject>(
+        &mut self,
+        vm_addr: u64,
+        mut vm: EncryptedHostAddressToEbpfVm<C>,
+    ) {
+        unsafe {
+            // SAFETY: Sound under the stacked lifetimes model – we've only one `VmAddress`.
+            vm.with_vm(|vm| {
+                let len = mem::size_of::<T>() as u64;
+                debug_assert!(len <= mem::size_of::<u64>() as u64);
+                debug_assert!(self.initialized);
+                vm.program_result = match invoke_access_violation_handler_then_map(
+                    vm.context(),
+                    AccessType::Load,
+                    vm_addr,
+                    len,
+                ) {
+                    StableResult::Err(e) => ProgramResult::Err(e),
+                    StableResult::Ok(buf) => {
+                        ProgramResult::Ok(ptr::read_unaligned::<T>(buf.ptr().cast()).into())
+                    }
+                };
+            })
+        }
+    }
+
+    /// Invokes access_violation_handler then stores `value` at the given guest address.
+    #[cold]
+    #[inline(never)]
+    pub fn store_second_attempt<T: Pod, C: ContextObject>(
+        &mut self,
+        value: T,
+        vm_addr: u64,
+        mut vm: EncryptedHostAddressToEbpfVm<C>,
+    ) {
+        unsafe {
+            // SAFETY: Sound under the stacked lifetimes model – we've only one `VmAddress`.
+            vm.with_vm(|vm| {
+                let len = mem::size_of::<T>() as u64;
+                debug_assert!(len <= mem::size_of::<u64>() as u64);
+                debug_assert!(self.initialized);
+                vm.program_result = match invoke_access_violation_handler_then_map(
+                    vm.context(),
+                    AccessType::Store,
+                    vm_addr,
+                    len,
+                ) {
+                    StableResult::Err(e) => ProgramResult::Err(e),
+                    StableResult::Ok(buf) => {
+                        ptr::write_unaligned::<T>(buf.ptr_mut().cast(), value);
+                        StableResult::Ok(0)
+                    }
+                };
+            })
+        }
+    }
+
+    /// Returns the `MemoryRegion` which may contain the given address.
+    #[inline(always)]
+    pub fn find_region(&self, vm_addr: u64) -> Option<(usize, &MemoryRegion)> {
+        debug_assert!(self.initialized);
+        match &self.ty {
+            MemoryMappingType::Aligned(inner) => inner.find_region(vm_addr),
+            MemoryMappingType::Unaligned(inner) => inner.find_region(vm_addr),
+        }
+    }
+
+    /// Returns the `MemoryRegion`s in this mapping.
+    #[inline(always)]
+    pub fn get_regions(&self) -> &[MemoryRegion] {
+        match &self.ty {
+            MemoryMappingType::Aligned(inner) => &inner.regions,
+            MemoryMappingType::Unaligned(inner) => &inner.regions,
+        }
+    }
+
+    /// Returns the [`MemoryRegion`]s as mutable.
+    ///
+    /// Modifying the regions might break the initialization constraints, so this function
+    /// uninitializes the mapping. The memory mappings must be initialized
+    /// again with [`Self::initialize`] before further use.
+    pub fn get_regions_mut(&mut self) -> &mut [MemoryRegion] {
+        self.initialized = false;
+
+        match &mut self.ty {
+            MemoryMappingType::Aligned(inner) => &mut inner.regions,
+            MemoryMappingType::Unaligned(inner) => &mut inner.regions,
+        }
+    }
+
+    /// Replaces the `MemoryRegion` at the given index
+    ///
+    /// # Safety
+    ///
+    /// Refer to [`MemoryMapping::new_uninitialized`].
+    #[inline(always)]
+    pub unsafe fn replace_region(
+        &mut self,
+        index: usize,
+        region: MemoryRegion,
+    ) -> Result<(), EbpfError> {
+        debug_assert!(self.initialized);
+        let new_is_gapped = region.vm_gap_shift != 63;
+        let regions = self.get_regions();
+        let next_region_start = regions
+            .get(index.saturating_add(1))
+            .map_or(u64::MAX, |next_region| next_region.vm_addr);
+        if index >= regions.len()
+            || regions[index].vm_addr != region.vm_addr
+            || region.vm_addr_range().end > next_region_start
+        {
+            return Err(EbpfError::InvalidMemoryRegion(index));
+        }
+        let res = match &mut self.ty {
+            MemoryMappingType::Aligned(inner) => inner.replace_region(index, region),
+            MemoryMappingType::Unaligned(inner) => inner.replace_region(index, region),
+        };
+        if res.is_ok() {
+            if new_is_gapped {
+                self.has_gapped_region = true;
+            } else if self.has_gapped_region {
+                self.has_gapped_region = self.get_regions().iter().any(|r| r.vm_gap_shift != 63);
+            }
+        }
+        res
+    }
+
+    /// Initialize the MemoryMapping
+    pub fn initialize(&mut self) -> Result<(), EbpfError> {
+        let result = match &mut self.ty {
+            MemoryMappingType::Aligned(inner) => inner.initialize(),
+            MemoryMappingType::Unaligned(inner) => inner.initialize(),
+        };
+        if result.is_ok() {
+            self.has_gapped_region = self.get_regions().iter().any(|r| r.vm_gap_shift != 63);
+            self.initialized = true;
+        } else {
+            self.initialized = false;
+        }
+        result
+    }
+
+    /// Returns `Some(host_addr)` iff an initialized, writable, non-gapped stack region exists at
+    /// [`ebpf::MM_STACK_START`] with `len >= required_stack_size`.
+    #[inline(always)]
+    pub(crate) fn fast_stack_host_addr(&self, required_stack_size: u64) -> Option<u64> {
+        if !self.initialized {
+            return None;
+        }
+        let region = match &self.ty {
+            MemoryMappingType::Aligned(inner) => {
+                let index = ebpf::MM_STACK_START
+                    .checked_shr(inner.virtual_address_bits)
+                    .unwrap_or(0) as usize;
+                inner.regions.get(index)?
+            }
+            MemoryMappingType::Unaligned(inner) => inner
+                .regions
+                .iter()
+                .find(|r| r.vm_addr == ebpf::MM_STACK_START)?,
+        };
+        if region.vm_addr == ebpf::MM_STACK_START
+            && region.writable != 0
+            && region.vm_gap_shift == 63
+            && region.len >= required_stack_size
+        {
+            Some(region.host_addr)
+        } else {
+            None
+        }
+    }
+
+    /// Returns `true` iff this mapping is initialized, contains no gapped regions, and matches the
+    /// mapping variant and shift compiled into the JIT fast path for `(config, sbpf_version)`.
+    #[inline(always)]
+    pub(crate) fn matches_jit_fast_path(&self, config: &Config, sbpf_version: SBPFVersion) -> bool {
+        if !self.initialized || self.has_gapped_region {
+            return false;
+        }
+        let expect_aligned = sbpf_version >= SBPFVersion::V4 || config.aligned_memory_mapping;
+        match &self.ty {
+            MemoryMappingType::Aligned(inner) => {
+                expect_aligned
+                    && inner.virtual_address_bits == config.aligned_region_size.trailing_zeros()
+            }
+            MemoryMappingType::Unaligned(_) => !expect_aligned,
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn generate_access_violation_for(
+        &self,
+        region: Option<&MemoryRegion>,
+        access_type: AccessType,
+        vm_addr: u64,
+        len: u64,
+    ) -> EbpfError {
+        let stack_frame = (vm_addr as i64)
+            .saturating_sub(ebpf::MM_STACK_START as i64)
+            .checked_div(self.stack_frame_size)
+            .unwrap_or(0);
+        if !self.sbpf_version.manual_stack_frame_bump()
+            && (-1..self.max_call_depth.saturating_add(1)).contains(&stack_frame)
+        {
+            EbpfError::StackAccessViolation(access_type, vm_addr, len, stack_frame)
+        } else {
+            let region_name = match vm_addr & (!ebpf::MM_BYTECODE_START.saturating_sub(1)) {
+                _ if region.map(|r| r.vm_addr_range().contains(&vm_addr)) != Some(true) => {
+                    "unallocated"
+                }
+                ebpf::MM_BYTECODE_START => "program",
+                ebpf::MM_STACK_START => "stack",
+                ebpf::MM_HEAP_START => "heap",
+                ebpf::MM_INPUT_START => "input",
+                _ => "allocated",
+            };
+            EbpfError::AccessViolation(access_type, vm_addr, len, region_name)
+        }
+    }
+}
+
+// `#[cold]`, `#[inline(never)]` have been experimentally determined to improve mapping function
+// throughput.
+// In the future using a `rust-cold` calling convention would help this further.
+#[cold]
+#[inline(never)]
+fn invoke_access_violation_handler_then_map<C: ContextObject>(
+    context_object: &mut C,
+    access_type: AccessType,
+    vm_addr: u64,
+    len: u64,
+) -> StableResult<HostBuffer, EbpfError> {
+    let memory_mapping = unsafe { context_object.active_mapping_ptr().as_mut() };
+    let regions = memory_mapping.get_regions();
+    let Some((region_index, region)) = memory_mapping.find_region(vm_addr) else {
+        debug_assert!(memory_mapping.find_region(vm_addr).is_none());
+        return StableResult::Err(memory_mapping.generate_access_violation_for(
+            None,
+            access_type,
+            vm_addr,
+            len,
+        ));
+    };
+    let mut region = region.clone();
+    let max_len = regions
+        .get(region_index.saturating_add(1))
+        .map_or(u64::MAX, |next_region| next_region.vm_addr)
+        .saturating_sub(region.vm_addr);
+    (memory_mapping.access_violation_handler)(
+        context_object,
+        &mut region,
+        max_len,
+        access_type,
+        vm_addr,
+        len,
+    );
+    let memory_mapping = unsafe { context_object.active_mapping_ptr().as_mut() };
+    if region.host_buffer().is_mutable() || access_type != AccessType::Store {
+        if let Some(host_buffer) = region.vm_to_host_buffer(vm_addr, len) {
+            if let Err(err) = unsafe { memory_mapping.replace_region(region_index, region) } {
+                return StableResult::Err(err);
+            }
+            return StableResult::Ok(host_buffer);
+        }
+    }
+    // The handler did not change the region in the mapping, so the original one still applies.
+    let region = memory_mapping.get_regions().get(region_index);
+    StableResult::Err(memory_mapping.generate_access_violation_for(
+        region,
+        access_type,
+        vm_addr,
+        len,
+    ))
+}
+
+/// Map virtual memory to host memory and potentially call the [AccessViolationHandler].
+///
+/// This requires the [MemoryMapping] to be mutable and
+/// can cause previously translated addresses to become invalid.
+pub fn map_with_access_violation_handler<C: ContextObject>(
+    context_object: &mut C,
+    access_type: AccessType,
+    vm_addr: u64,
+    len: u64,
+) -> StableResult<HostBuffer, EbpfError> {
+    let memory_mapping = unsafe { context_object.active_mapping_ptr().as_mut() };
+    if let Some(host_buffer) = memory_mapping.map_fast(access_type, vm_addr, len) {
+        return StableResult::Ok(host_buffer);
+    }
+    // The slow path is out of line, so that the code in there doesn't make the callers of the
+    // fast path save and restore registers they otherwise do not need to. Note, that a single
+    // call site for the cold path matters. Split it up and LLVM merges their results with the
+    // fast path's through the stack.
+    invoke_access_violation_handler_then_map(context_object, access_type, vm_addr, len)
+}
+
+/// Cached `(vm_addr_start, vm_len, region_index)` entry in [`MappingCache`].
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub(crate) struct MappingCacheEntry {
+    pub(crate) vm_addr_start: u64,
+    pub(crate) vm_len: u64,
+    pub(crate) region_index: usize,
+}
+
+#[allow(dead_code)]
+impl MappingCacheEntry {
+    pub(crate) const VM_ADDR_START_OFFSET: usize = mem::offset_of!(Self, vm_addr_start);
+    pub(crate) const VM_LEN_OFFSET: usize = mem::offset_of!(Self, vm_len);
+    pub(crate) const REGION_INDEX_OFFSET: usize = mem::offset_of!(Self, region_index);
+    pub(crate) const SIZE: usize = mem::size_of::<Self>();
+
+    const _LAYOUT_ASSERTS: () = {
+        assert!(Self::VM_ADDR_START_OFFSET == 0);
+        assert!(Self::VM_LEN_OFFSET == 8);
+        assert!(Self::REGION_INDEX_OFFSET == 16);
+        assert!(Self::SIZE == 24);
+    };
+}
+
+/// Fast, small linear cache used to speed up unaligned memory mapping.
+#[derive(Debug)]
+#[repr(C)]
+pub(crate) struct MappingCache {
+    // The cached entries.
+    pub(crate) entries: [MappingCacheEntry; MappingCache::SIZE],
+    // Index of the last accessed memory region.
+    //
+    // New entries are written backwards, so that find() can always scan
+    // forward which is faster.
+    head: usize,
+}
+
+impl MappingCache {
+    // must be a power of two
+    pub(crate) const SIZE: usize = 4;
+
+    fn new() -> MappingCache {
+        MappingCache {
+            entries: array::from_fn(|_| MappingCacheEntry {
+                vm_addr_start: 0,
+                vm_len: 0,
+                region_index: 0,
+            }),
+            head: 0,
+        }
+    }
+
+    #[inline]
+    fn find(&self, vm_addr: u64) -> Option<usize> {
+        for i in 0..Self::SIZE {
+            let index = self.head.wrapping_add(i) % Self::SIZE;
+            // Safety:
+            // index is guaranteed to be between 0..Self::SIZE
+            let entry = unsafe { self.entries.get_unchecked(index) };
+            if vm_addr.wrapping_sub(entry.vm_addr_start) < entry.vm_len {
+                return Some(entry.region_index);
+            }
+        }
+
+        None
+    }
+
+    #[inline]
+    fn insert(&mut self, vm_range: Range<u64>, region_index: usize) {
+        self.head = self.head.wrapping_sub(1) % Self::SIZE;
+        // Safety:
+        // self.head is guaranteed to be between 0..Self::SIZE
+        unsafe {
+            *self.entries.get_unchecked_mut(self.head) = MappingCacheEntry {
+                vm_addr_start: vm_range.start,
+                vm_len: vm_range.end.saturating_sub(vm_range.start),
+                region_index,
+            };
+        }
+    }
+
+    #[inline]
+    fn flush(&mut self) {
+        self.entries = array::from_fn(|_| MappingCacheEntry {
+            vm_addr_start: 0,
+            vm_len: 0,
+            region_index: 0,
+        });
+        self.head = 0;
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{
+        assert_error, ebpf::MM_REGION_SIZE, program::BuiltinProgram, test_utils::TestContextObject,
+        vm::EbpfVm,
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    use super::*;
+
+    #[test]
+    fn test_mapping_cache() {
+        let mut cache = MappingCache::new();
+        assert_eq!(cache.find(0), None);
+
+        let mut ranges = vec![10u64..20, 20..30, 30..40, 40..50];
+        for (region, range) in ranges.iter().cloned().enumerate() {
+            cache.insert(range, region);
+        }
+        for (region, range) in ranges.iter().enumerate() {
+            if region > 0 {
+                assert_eq!(cache.find(range.start - 1), Some(region - 1));
+            } else {
+                assert_eq!(cache.find(range.start - 1), None);
+            }
+            assert_eq!(cache.find(range.start), Some(region));
+            assert_eq!(cache.find(range.start + 1), Some(region));
+            assert_eq!(cache.find(range.end - 1), Some(region));
+            if region < 3 {
+                assert_eq!(cache.find(range.end), Some(region + 1));
+            } else {
+                assert_eq!(cache.find(range.end), None);
+            }
+        }
+
+        cache.insert(50..60, 4);
+        ranges.push(50..60);
+        for (region, range) in ranges.iter().enumerate() {
+            if region == 0 {
+                assert_eq!(cache.find(range.start), None);
+                continue;
+            }
+            if region > 1 {
+                assert_eq!(cache.find(range.start - 1), Some(region - 1));
+            } else {
+                assert_eq!(cache.find(range.start - 1), None);
+            }
+            assert_eq!(cache.find(range.start), Some(region));
+            assert_eq!(cache.find(range.start + 1), Some(region));
+            assert_eq!(cache.find(range.end - 1), Some(region));
+            if region < 4 {
+                assert_eq!(cache.find(range.end), Some(region + 1));
+            } else {
+                assert_eq!(cache.find(range.end), None);
+            }
+        }
+    }
+
+    #[test]
+    fn test_mapping_cache_flush() {
+        let mut cache = MappingCache::new();
+        assert_eq!(cache.find(0), None);
+        cache.insert(0..10, 0);
+        assert_eq!(cache.find(0), Some(0));
+        cache.flush();
+        assert_eq!(cache.find(0), None);
+    }
+
+    #[test]
+    fn test_map_empty() {
+        for aligned_memory_mapping in [false, true] {
+            let config = Config {
+                aligned_memory_mapping,
+                ..Config::default()
+            };
+            let m = unsafe { MemoryMapping::new(vec![], &config, SBPFVersion::V3) }.unwrap();
+            assert_error!(
+                m.map(AccessType::Load, ebpf::MM_REGION_SIZE, 8),
+                "AccessViolation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gapped_map() {
+        for aligned_memory_mapping in [false, true] {
+            let config = Config {
+                aligned_memory_mapping,
+                ..Config::default()
+            };
+            let mut mem1 = [0xff; 8];
+            let mem2 = [0; 8];
+            let mut m = unsafe {
+                MemoryMapping::new(
+                    vec![
+                        MemoryRegion::new(&raw const mem2[..], ebpf::MM_REGION_SIZE),
+                        MemoryRegion::new_gapped(&raw mut mem1[..], ebpf::MM_REGION_SIZE * 2, 2),
+                    ],
+                    &config,
+                    SBPFVersion::V3,
+                )
+                .unwrap()
+            };
+            for frame in 0..4 {
+                let address = ebpf::MM_STACK_START + frame * 4;
+                assert!(m.find_region(address).is_some());
+                assert!(m.map(AccessType::Load, address, 2).is_ok());
+                assert_error!(m.map(AccessType::Load, address + 2, 2), "AccessViolation");
+                assert_eq!(m.load_first_attempt::<u16>(address).unwrap(), 0xFFFF);
+                assert_eq!(m.load_first_attempt::<u16>(address + 2), None);
+                assert!(m.store_first_attempt::<u16>(0xFFFF, address));
+                assert!(!m.store_first_attempt::<u16>(0xFFFF, address + 2));
+            }
+        }
+    }
+
+    #[test]
+    fn test_unaligned_map_overlap() {
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+        let mem1 = [1, 2, 3, 4];
+        let mem2 = [5, 6];
+        assert_error!(
+            unsafe {
+                MemoryMapping::new(
+                    vec![
+                        MemoryRegion::new(&raw const mem1, ebpf::MM_REGION_SIZE),
+                        MemoryRegion::new(
+                            &raw const mem2,
+                            ebpf::MM_REGION_SIZE + mem1.len() as u64 - 1,
+                        ),
+                    ],
+                    &config,
+                    SBPFVersion::V3,
+                )
+            },
+            "InvalidMemoryRegion(1)"
+        );
+        assert!(unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw const mem1, ebpf::MM_REGION_SIZE),
+                    MemoryRegion::new(&raw const mem2, ebpf::MM_REGION_SIZE + mem1.len() as u64),
+                ],
+                &config,
+                SBPFVersion::V3,
+            )
+        }
+        .is_ok());
+    }
+
+    #[test]
+    fn test_unaligned_map() {
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+        let mut mem1 = [11];
+        let mem2 = [22, 22];
+        let mem3 = [33];
+        let mem4 = [44, 44];
+        let m = unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw mut mem1, ebpf::MM_REGION_SIZE),
+                    MemoryRegion::new(&raw const mem2, ebpf::MM_REGION_SIZE + mem1.len() as u64),
+                    MemoryRegion::new(
+                        &raw const mem3,
+                        ebpf::MM_REGION_SIZE + (mem1.len() + mem2.len()) as u64,
+                    ),
+                    MemoryRegion::new(
+                        &raw const mem4,
+                        ebpf::MM_REGION_SIZE + (mem1.len() + mem2.len() + mem3.len()) as u64,
+                    ),
+                ],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            m.map(AccessType::Load, ebpf::MM_REGION_SIZE, 1)
+                .unwrap()
+                .ptr()
+                .addr(),
+            mem1.as_ptr().addr()
+        );
+
+        assert_eq!(
+            m.map(AccessType::Store, ebpf::MM_REGION_SIZE, 1)
+                .unwrap()
+                .ptr()
+                .addr(),
+            mem1.as_ptr().addr()
+        );
+
+        assert_error!(
+            m.map(AccessType::Load, ebpf::MM_REGION_SIZE, 2),
+            "AccessViolation"
+        );
+
+        assert_eq!(
+            m.map(
+                AccessType::Load,
+                ebpf::MM_REGION_SIZE + mem1.len() as u64,
+                1,
+            )
+            .unwrap()
+            .ptr()
+            .addr(),
+            mem2.as_ptr().addr()
+        );
+
+        assert_eq!(
+            m.map(
+                AccessType::Load,
+                ebpf::MM_REGION_SIZE + (mem1.len() + mem2.len()) as u64,
+                1,
+            )
+            .unwrap()
+            .ptr()
+            .addr(),
+            mem3.as_ptr().addr()
+        );
+
+        assert_eq!(
+            m.map(
+                AccessType::Load,
+                ebpf::MM_REGION_SIZE + (mem1.len() + mem2.len() + mem3.len()) as u64,
+                1,
+            )
+            .unwrap()
+            .ptr()
+            .addr(),
+            mem4.as_ptr().addr()
+        );
+
+        assert_error!(
+            m.map(
+                AccessType::Load,
+                ebpf::MM_REGION_SIZE + (mem1.len() + mem2.len() + mem3.len() + mem4.len()) as u64,
+                1,
+            ),
+            "AccessViolation"
+        );
+    }
+
+    #[test]
+    fn test_unaligned_region() {
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+
+        let mut mem1 = [0xFF; 4];
+        let mem2 = [0xDD; 4];
+        let m = unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw mut mem1, ebpf::MM_REGION_SIZE),
+                    MemoryRegion::new(&raw const mem2, ebpf::MM_REGION_SIZE + 4),
+                ],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+        assert!(m.find_region(ebpf::MM_REGION_SIZE - 1).is_none());
+        assert_eq!(
+            HostBuffer::Mutable(&raw mut mem1[..]),
+            m.find_region(ebpf::MM_REGION_SIZE).unwrap().1.host_buffer(),
+        );
+        assert_eq!(
+            HostBuffer::Mutable(&raw mut mem1[..]),
+            m.find_region(ebpf::MM_REGION_SIZE + 3)
+                .unwrap()
+                .1
+                .host_buffer(),
+        );
+        assert_eq!(
+            HostBuffer::Immutable(&raw const mem2[..]),
+            m.find_region(ebpf::MM_REGION_SIZE + 4)
+                .unwrap()
+                .1
+                .host_buffer(),
+        );
+        assert_eq!(
+            HostBuffer::Immutable(&raw const mem2[..]),
+            m.find_region(ebpf::MM_REGION_SIZE + 7)
+                .unwrap()
+                .1
+                .host_buffer(),
+        );
+        assert!(m.find_region(ebpf::MM_REGION_SIZE + 8).is_some());
+    }
+
+    #[test]
+    fn test_aligned_region() {
+        let config = Config {
+            aligned_memory_mapping: true,
+            ..Config::default()
+        };
+
+        let mut mem1 = [0xFF; 4];
+        let mem2 = [0xDD; 4];
+        let m = unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw mut mem1, ebpf::MM_REGION_SIZE),
+                    MemoryRegion::new(&raw const mem2, ebpf::MM_REGION_SIZE * 2),
+                ],
+                &config,
+                SBPFVersion::V4,
+            )
+            .unwrap()
+        };
+        assert_eq!(m.find_region(ebpf::MM_REGION_SIZE - 1).unwrap().1.len(), 0);
+        assert_eq!(
+            HostBuffer::Mutable(&raw mut mem1[..]),
+            m.find_region(ebpf::MM_REGION_SIZE).unwrap().1.host_buffer(),
+        );
+        assert_eq!(
+            HostBuffer::Mutable(&raw mut mem1[..]),
+            m.find_region(ebpf::MM_REGION_SIZE + 3)
+                .unwrap()
+                .1
+                .host_buffer(),
+        );
+        assert!(m.find_region(ebpf::MM_REGION_SIZE + 4).is_some());
+        assert_eq!(
+            HostBuffer::Immutable(&raw const mem2[..]),
+            m.find_region(ebpf::MM_REGION_SIZE * 2)
+                .unwrap()
+                .1
+                .host_buffer(),
+        );
+        assert_eq!(
+            HostBuffer::Immutable(&raw const mem2[..]),
+            m.find_region(ebpf::MM_REGION_SIZE * 2 + 3)
+                .unwrap()
+                .1
+                .host_buffer(),
+        );
+        assert!(m.find_region(ebpf::MM_REGION_SIZE * 3 + 4).is_none());
+    }
+
+    #[test]
+    fn test_unaligned_map_load() {
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+        let mem1 = [0x11, 0x22];
+        let mem2 = [0x33];
+        let mut m = unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw const mem1, ebpf::MM_REGION_SIZE),
+                    MemoryRegion::new(&raw const mem2, ebpf::MM_REGION_SIZE + mem1.len() as u64),
+                ],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            m.load_first_attempt::<u16>(ebpf::MM_REGION_SIZE).unwrap(),
+            0x2211
+        );
+        assert_eq!(m.load_first_attempt::<u32>(ebpf::MM_REGION_SIZE), None);
+        assert_eq!(m.load_first_attempt::<u32>(ebpf::MM_REGION_SIZE + 4), None);
+    }
+
+    #[test]
+    fn test_unaligned_map_store() {
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+        let mut mem1 = [0xff, 0xff];
+        let mut mem2 = [0xff];
+        let mut m = unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw mut mem1, ebpf::MM_REGION_SIZE),
+                    MemoryRegion::new(&raw mut mem2, ebpf::MM_REGION_SIZE + mem1.len() as u64),
+                ],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+
+        assert!(m.store_first_attempt(0x1122u16, ebpf::MM_REGION_SIZE));
+        assert_eq!(
+            m.load_first_attempt::<u16>(ebpf::MM_REGION_SIZE).unwrap(),
+            0x1122
+        );
+
+        assert!(!m.store_first_attempt(0x33445566u32, ebpf::MM_REGION_SIZE));
+    }
+
+    #[test]
+    fn test_unaligned_map_store_out_of_bounds() {
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+
+        let mut mem1 = [0xFF];
+        let mut m = unsafe {
+            MemoryMapping::new(
+                vec![MemoryRegion::new(&raw mut mem1, ebpf::MM_REGION_SIZE)],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+        assert!(m.store_first_attempt(0x11u8, ebpf::MM_REGION_SIZE));
+        assert!(!m.store_first_attempt(0x11u8, ebpf::MM_REGION_SIZE - 1));
+        assert!(!m.store_first_attempt(0x11u8, ebpf::MM_REGION_SIZE + 1));
+        // this gets us line coverage for the case where we're completely
+        // outside the address space (the case above is just on the edge)
+        assert!(!m.store_first_attempt(0x11u8, ebpf::MM_REGION_SIZE + 2));
+
+        let mut mem1 = [0xFF; 4];
+        let mut mem2 = [0xDD; 4];
+        let mut m = unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw mut mem1, ebpf::MM_REGION_SIZE),
+                    MemoryRegion::new(&raw mut mem2, ebpf::MM_REGION_SIZE + 4),
+                ],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+        assert!(!m.store_first_attempt(0x1122334455667788u64, ebpf::MM_REGION_SIZE));
+    }
+
+    #[test]
+    fn test_unaligned_map_load_out_of_bounds() {
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+
+        let mem1 = [0xff];
+        let mut m = unsafe {
+            MemoryMapping::new(
+                vec![MemoryRegion::new(&raw const mem1, ebpf::MM_REGION_SIZE)],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            m.load_first_attempt::<u8>(ebpf::MM_REGION_SIZE).unwrap(),
+            0xff
+        );
+        assert_eq!(m.load_first_attempt::<u8>(ebpf::MM_REGION_SIZE - 1), None);
+        assert_eq!(m.load_first_attempt::<u8>(ebpf::MM_REGION_SIZE + 1), None);
+        assert_eq!(m.load_first_attempt::<u8>(ebpf::MM_REGION_SIZE + 2), None);
+
+        let mem1 = [0xFF; 4];
+        let mem2 = [0xDD; 4];
+        let mut m = unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw const mem1, ebpf::MM_REGION_SIZE),
+                    MemoryRegion::new(&raw const mem2, ebpf::MM_REGION_SIZE + 4),
+                ],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+        assert_eq!(m.load_first_attempt::<u64>(ebpf::MM_REGION_SIZE), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "AccessViolation")]
+    fn test_store_readonly() {
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+        let mut mem1 = [0xff, 0xff];
+        let mem2 = [0xff, 0xff];
+        let m = unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw mut mem1, ebpf::MM_REGION_SIZE),
+                    MemoryRegion::new(&raw const mem2, ebpf::MM_REGION_SIZE + mem1.len() as u64),
+                ],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+        m.map(AccessType::Store, ebpf::MM_REGION_SIZE, 4).unwrap();
+    }
+
+    #[test]
+    fn test_unaligned_map_replace_region() {
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+        let mem1 = [11];
+        let mem2 = [22, 22];
+        let mem3 = [33];
+        let mut m = unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw const mem1, ebpf::MM_REGION_SIZE),
+                    MemoryRegion::new(&raw const mem2, ebpf::MM_REGION_SIZE + mem1.len() as u64),
+                ],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            m.map(AccessType::Load, ebpf::MM_REGION_SIZE, 1)
+                .unwrap()
+                .ptr()
+                .addr(),
+            mem1.as_ptr().addr()
+        );
+
+        assert_eq!(
+            m.map(
+                AccessType::Load,
+                ebpf::MM_REGION_SIZE + mem1.len() as u64,
+                1,
+            )
+            .unwrap()
+            .ptr()
+            .addr(),
+            mem2.as_ptr().addr()
+        );
+
+        assert_error!(
+            unsafe {
+                m.replace_region(
+                    2,
+                    MemoryRegion::new(&raw const mem3, ebpf::MM_REGION_SIZE + mem1.len() as u64),
+                )
+            },
+            "InvalidMemoryRegion(2)"
+        );
+
+        let region_index = m
+            .get_regions()
+            .iter()
+            .position(|mem| mem.vm_addr == ebpf::MM_REGION_SIZE + mem1.len() as u64)
+            .unwrap();
+
+        // old.vm_addr != new.vm_addr
+        assert_error!(
+            unsafe {
+                m.replace_region(
+                    region_index,
+                    MemoryRegion::new(
+                        &raw const mem3,
+                        ebpf::MM_REGION_SIZE + mem1.len() as u64 + 1,
+                    ),
+                )
+            },
+            "InvalidMemoryRegion({})",
+            region_index
+        );
+
+        unsafe {
+            m.replace_region(
+                region_index,
+                MemoryRegion::new(&raw const mem3, ebpf::MM_REGION_SIZE + mem1.len() as u64),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            m.map(
+                AccessType::Load,
+                ebpf::MM_REGION_SIZE + mem1.len() as u64,
+                1,
+            )
+            .unwrap()
+            .ptr()
+            .addr(),
+            mem3.as_ptr().addr()
+        );
+    }
+
+    #[test]
+    fn test_aligned_map_replace_region() {
+        let config = Config {
+            aligned_memory_mapping: true,
+            ..Config::default()
+        };
+        let mem1 = [11];
+        let mem2 = [22, 22];
+        let mem3 = [33, 33];
+        let mut m = unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw const mem1, ebpf::MM_REGION_SIZE),
+                    MemoryRegion::new(&raw const mem2, ebpf::MM_REGION_SIZE * 2),
+                ],
+                &config,
+                SBPFVersion::V4,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            m.map(AccessType::Load, ebpf::MM_REGION_SIZE * 2, 1)
+                .unwrap()
+                .ptr()
+                .addr(),
+            mem2.as_ptr().addr()
+        );
+
+        // index > regions.len()
+        assert_error!(
+            unsafe {
+                m.replace_region(
+                    3,
+                    MemoryRegion::new(&raw const mem3, ebpf::MM_REGION_SIZE * 2),
+                )
+            },
+            "InvalidMemoryRegion(3)"
+        );
+
+        // index != addr >> VIRTUAL_ADDRESS_BITS
+        assert_error!(
+            unsafe {
+                m.replace_region(
+                    2,
+                    MemoryRegion::new(&raw const mem3, ebpf::MM_REGION_SIZE * 3),
+                )
+            },
+            "InvalidMemoryRegion(2)"
+        );
+
+        // index + len != addr >> VIRTUAL_ADDRESS_BITS
+        assert_error!(
+            unsafe {
+                m.replace_region(
+                    2,
+                    MemoryRegion::new(&raw const mem3, ebpf::MM_REGION_SIZE * 3 - 1),
+                )
+            },
+            "InvalidMemoryRegion(2)"
+        );
+
+        unsafe {
+            m.replace_region(
+                2,
+                MemoryRegion::new(&raw const mem3, ebpf::MM_REGION_SIZE * 2),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            m.map(AccessType::Load, ebpf::MM_REGION_SIZE * 2, 1)
+                .unwrap()
+                .ptr()
+                .addr(),
+            mem3.as_ptr().addr()
+        );
+    }
+
+    #[test]
+    fn test_aligned_initialize_variable_region_size() {
+        // 128MB and 256MB regions
+        for region_size in [1u64 << 27, 1u64 << 28] {
+            let mut mem1 = [1u8; 4];
+            let mem2 = [2u8; 4];
+            let mut mapping = unsafe {
+                AlignedMemoryMapping::new_uninitialized(
+                    vec![
+                        MemoryRegion::new(&raw mut mem1[..], 0),
+                        MemoryRegion::new(&raw const mem2[..], region_size * 2),
+                    ],
+                    region_size as usize,
+                )
+            };
+            assert!(mapping.initialize().is_ok());
+            // the gap at slot 1 is filled with an empty region
+            assert_eq!(mapping.regions.len(), 3);
+            assert_eq!(mapping.regions[1].vm_addr, region_size);
+            assert_eq!(mapping.regions[1].len(), 0);
+            assert_eq!(
+                HostBuffer::Mutable(&raw mut mem1[..]),
+                mapping.regions[0].host_buffer(),
+            );
+            assert_eq!(
+                HostBuffer::Immutable(&raw const mem2[..]),
+                mapping.regions[2].host_buffer(),
+            );
+
+            // two regions in the same slot are rejected
+            let mut mapping = unsafe {
+                AlignedMemoryMapping::new_uninitialized(
+                    vec![
+                        MemoryRegion::new(&raw mut mem1[..], 0),
+                        MemoryRegion::new(&raw const mem2[..], region_size / 2),
+                    ],
+                    region_size as usize,
+                )
+            };
+            assert_error!(mapping.initialize(), "InvalidMemoryRegion(0)");
+        }
+    }
+
+    #[test]
+    fn test_aligned_find_region_variable_region_size() {
+        // 128MB and 256MB regions
+        for region_size in [1u64 << 27, 1u64 << 28] {
+            let mem1 = [1u8; 4];
+            let mem2 = [2u8; 4];
+            let mapping = unsafe {
+                AlignedMemoryMapping::new(
+                    vec![
+                        MemoryRegion::new(&raw const mem1[..], 0),
+                        MemoryRegion::new(&raw const mem2[..], region_size * 2),
+                    ],
+                    region_size as usize,
+                )
+            }
+            .unwrap();
+            // slot 0
+            assert_eq!(
+                HostBuffer::Immutable(&raw const mem1[..]),
+                mapping.find_region(0).unwrap().1.host_buffer(),
+            );
+            assert_eq!(
+                HostBuffer::Immutable(&raw const mem1[..]),
+                mapping
+                    .find_region(region_size - 1)
+                    .unwrap()
+                    .1
+                    .host_buffer(),
+            );
+            // slot 1 is the empty region inserted by initialize()
+            assert_eq!(mapping.find_region(region_size).unwrap().0, 1);
+            assert_eq!(mapping.find_region(region_size * 2 - 1).unwrap().1.len(), 0);
+            // slot 2
+            assert_eq!(
+                HostBuffer::Immutable(&raw const mem2[..]),
+                mapping
+                    .find_region(region_size * 2)
+                    .unwrap()
+                    .1
+                    .host_buffer(),
+            );
+            assert_eq!(
+                HostBuffer::Immutable(&raw const mem2[..]),
+                mapping
+                    .find_region(region_size * 3 - 1)
+                    .unwrap()
+                    .1
+                    .host_buffer(),
+            );
+            // beyond the last region
+            assert!(mapping.find_region(region_size * 3).is_none());
+        }
+    }
+
+    #[test]
+    fn test_aligned_replace_region_variable_region_size() {
+        // 128MB and 256MB regions
+        for region_size in [1u64 << 27, 1u64 << 28] {
+            let mem1 = [1u8; 4];
+            let mem2 = [2u8; 4];
+            let mem3 = [3u8; 4];
+            let mut mapping = unsafe {
+                AlignedMemoryMapping::new(
+                    vec![
+                        MemoryRegion::new(&raw const mem1[..], 0),
+                        MemoryRegion::new(&raw const mem2[..], region_size * 2),
+                    ],
+                    region_size as usize,
+                )
+            }
+            .unwrap();
+
+            // index != addr >> virtual_address_bits
+            assert_error!(
+                unsafe { mapping.replace_region(1, MemoryRegion::new(&raw const mem3[..], 0)) },
+                "InvalidMemoryRegion(1)"
+            );
+
+            // the region spans two slots
+            assert_error!(
+                unsafe {
+                    mapping.replace_region(
+                        2,
+                        MemoryRegion::new(&raw const mem3[..], region_size * 3 - 2),
+                    )
+                },
+                "InvalidMemoryRegion(2)"
+            );
+
+            // a valid replacement within slot 2
+            unsafe {
+                mapping
+                    .replace_region(2, MemoryRegion::new(&raw const mem3[..], region_size * 2))
+                    .unwrap()
+            };
+            assert_eq!(
+                HostBuffer::Immutable(&raw const mem3[..]),
+                mapping
+                    .find_region(region_size * 2)
+                    .unwrap()
+                    .1
+                    .host_buffer(),
+            );
+        }
+    }
+
+    #[test]
+    fn test_access_violation_handler_map() {
+        for aligned_memory_mapping in [true, false] {
+            let config = Config {
+                aligned_memory_mapping,
+                ..Config::default()
+            };
+            let original = [11, 22];
+            let copied = Rc::new(RefCell::new(Vec::new()));
+            let mut regions = vec![MemoryRegion::new(&raw const original, ebpf::MM_REGION_SIZE)];
+            regions[0].access_violation_handler_payload = Some(0);
+
+            let c = Rc::clone(&copied);
+            let mut context_object = TestContextObject::new(0);
+            context_object.memory_mapping = unsafe {
+                MemoryMapping::new_with_access_violation_handler(
+                    regions,
+                    &config,
+                    SBPFVersion::V3,
+                    Box::new(move |_, region, _, _, _, _| {
+                        let mut vec = c.borrow_mut();
+                        vec.extend_from_slice(&original);
+                        region.redirect(&raw mut vec[..]);
+                    }),
+                )
+                .unwrap()
+            };
+
+            assert_eq!(
+                map_with_access_violation_handler(
+                    &mut context_object,
+                    AccessType::Load,
+                    ebpf::MM_REGION_SIZE,
+                    1,
+                )
+                .unwrap()
+                .ptr()
+                .addr(),
+                original.as_ptr().addr()
+            );
+            assert_eq!(
+                map_with_access_violation_handler(
+                    &mut context_object,
+                    AccessType::Store,
+                    ebpf::MM_REGION_SIZE,
+                    1,
+                )
+                .unwrap()
+                .ptr()
+                .addr(),
+                copied.borrow().as_ptr().addr()
+            );
+        }
+    }
+
+    #[test]
+    fn test_access_violation_handler_load_store() {
+        for aligned_memory_mapping in [true, false] {
+            let config = Config {
+                aligned_memory_mapping,
+                ..Config::default()
+            };
+            let loader = std::sync::Arc::new(BuiltinProgram::new_mock());
+            let original = [11, 22];
+            let copied = Rc::new(RefCell::new(Vec::new()));
+            let mut regions = vec![MemoryRegion::new(&raw const original, ebpf::MM_REGION_SIZE)];
+            regions[0].access_violation_handler_payload = Some(0);
+
+            let c = Rc::clone(&copied);
+            let mut context_object = TestContextObject::new(0);
+            context_object.memory_mapping = unsafe {
+                MemoryMapping::new_with_access_violation_handler(
+                    regions,
+                    &config,
+                    SBPFVersion::V3,
+                    Box::new(move |_, region, _, _, _, _| {
+                        let mut vec = c.borrow_mut();
+                        vec.extend_from_slice(&original);
+                        region.redirect(&raw mut vec[..]);
+                    }),
+                )
+                .unwrap()
+            };
+            let mut vm = EbpfVm::new(
+                loader,
+                *config.enabled_sbpf_versions.end(),
+                &mut context_object,
+                0,
+            );
+            let memory_mapping = unsafe { vm.memory_mapping.as_mut() };
+
+            assert_eq!(
+                memory_mapping
+                    .map(AccessType::Load, ebpf::MM_REGION_SIZE, 1)
+                    .unwrap()
+                    .ptr()
+                    .addr(),
+                original.as_ptr().addr()
+            );
+            assert_eq!(
+                memory_mapping
+                    .load_first_attempt::<u8>(ebpf::MM_REGION_SIZE)
+                    .unwrap(),
+                11
+            );
+            assert_eq!(
+                memory_mapping
+                    .load_first_attempt::<u8>(ebpf::MM_REGION_SIZE + 1)
+                    .unwrap(),
+                22
+            );
+            assert!(copied.borrow().is_empty());
+
+            memory_mapping.store_second_attempt(
+                33u8,
+                ebpf::MM_REGION_SIZE,
+                vm.encrypted_host_address(),
+            );
+            assert_eq!(original[0], 11);
+            assert_eq!(
+                memory_mapping
+                    .load_first_attempt::<u8>(ebpf::MM_REGION_SIZE)
+                    .unwrap(),
+                33
+            );
+            assert_eq!(
+                memory_mapping
+                    .load_first_attempt::<u8>(ebpf::MM_REGION_SIZE + 1)
+                    .unwrap(),
+                22
+            );
+        }
+    }
+
+    #[test]
+    fn test_access_violation_handler_region_id() {
+        for aligned_memory_mapping in [true, false] {
+            let config = Config {
+                aligned_memory_mapping,
+                ..Config::default()
+            };
+            let loader = std::sync::Arc::new(BuiltinProgram::new_mock());
+            let original1 = [11, 22];
+            let original2 = [33, 44];
+            let copied = Rc::new(RefCell::new(Vec::new()));
+
+            let mut regions = vec![
+                MemoryRegion::new(&raw const original1, ebpf::MM_REGION_SIZE),
+                MemoryRegion::new(&raw const original2, ebpf::MM_REGION_SIZE * 2),
+            ];
+            regions[0].access_violation_handler_payload = Some(42);
+
+            let c = Rc::clone(&copied);
+            let mut context_object = TestContextObject::new(0);
+            context_object.memory_mapping = unsafe {
+                MemoryMapping::new_with_access_violation_handler(
+                    regions,
+                    &config,
+                    SBPFVersion::V3,
+                    Box::new(move |_, region, _, _, _, _| {
+                        // check that the argument passed to MemoryRegion::new is then passed to the
+                        // callback
+                        assert_eq!(region.access_violation_handler_payload, Some(42));
+                        let mut vec = c.borrow_mut();
+                        vec.extend_from_slice(&original1);
+                        region.redirect(&raw mut vec[..]);
+                    }),
+                )
+                .unwrap()
+            };
+            let mut vm = EbpfVm::new(
+                loader,
+                *config.enabled_sbpf_versions.end(),
+                &mut context_object,
+                0,
+            );
+            let memory_mapping = unsafe { vm.memory_mapping.as_mut() };
+
+            memory_mapping.store_second_attempt(
+                55u8,
+                ebpf::MM_REGION_SIZE,
+                vm.encrypted_host_address(),
+            );
+            assert_eq!(original1[0], 11);
+            assert_eq!(
+                memory_mapping
+                    .load_first_attempt::<u8>(ebpf::MM_REGION_SIZE)
+                    .unwrap(),
+                55
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "AccessViolation")]
+    fn test_map_access_violation_handler_error() {
+        let config = Config::default();
+        let original = [11, 22];
+
+        let m = unsafe {
+            MemoryMapping::new_with_access_violation_handler(
+                vec![MemoryRegion::new(&raw const original, ebpf::MM_REGION_SIZE)],
+                &config,
+                SBPFVersion::V4,
+                Box::new(default_access_violation_handler),
+            )
+            .unwrap()
+        };
+
+        m.map(AccessType::Store, ebpf::MM_REGION_SIZE, 1).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "AccessViolation")]
+    fn test_store_access_violation_handler_error() {
+        let config = Config::default();
+        let original = [11, 22];
+
+        let m = unsafe {
+            MemoryMapping::new_with_access_violation_handler(
+                vec![MemoryRegion::new(&raw const original, ebpf::MM_REGION_SIZE)],
+                &config,
+                SBPFVersion::V4,
+                Box::new(default_access_violation_handler),
+            )
+            .unwrap()
+        };
+
+        m.map(AccessType::Store, ebpf::MM_REGION_SIZE, 1).unwrap();
+    }
+
+    #[test]
+    fn test_access_violation_region_identification() {
+        let config = Config::default();
+        let original = [11, 22];
+        let region = 0x10_0000_0000;
+        let m = unsafe {
+            MemoryMapping::new(
+                vec![MemoryRegion::new(&raw const original, region)],
+                &config,
+                SBPFVersion::V4,
+            )
+            .unwrap()
+        };
+        let store_err_inbound = m.map(AccessType::Store, region, 1).unwrap_err();
+        assert_eq!(
+            store_err_inbound.to_string(),
+            "Access violation writing 1 bytes at address 0x1000000000 (in allocated region)"
+        );
+        let store_err_oob = m.map(AccessType::Load, region + 3, 8).unwrap_err();
+        assert_eq!(
+            store_err_oob.to_string(),
+            "Access violation reading 8 bytes at address 0x1000000003 (in unallocated region)"
+        );
+    }
+
+    #[test]
+    fn v4_aligned_mapping() {
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+
+        let mem = [11, 12];
+        let mapping = unsafe {
+            MemoryMapping::new_with_access_violation_handler(
+                vec![MemoryRegion::new(&raw const mem, ebpf::MM_REGION_SIZE)],
+                &config,
+                SBPFVersion::V4,
+                Box::new(default_access_violation_handler),
+            )
+            .unwrap()
+        };
+
+        assert!(matches!(mapping.ty, MemoryMappingType::Aligned(_)));
+    }
+
+    #[test]
+    fn test_different_region_sizes() {
+        let mem1 = b"solana";
+        let mem2 = b"is";
+        let mem3 = b"cool";
+        let mem4 = b"innit?";
+        for region_size in [128 * 1024 * 1024, 256 * 1024 * 1024] {
+            let mut mapping = unsafe {
+                AlignedMemoryMapping::new_uninitialized(
+                    vec![
+                        MemoryRegion::new(&raw const mem1[..], region_size),
+                        MemoryRegion::new(&raw const mem2[..], 2 * region_size),
+                        MemoryRegion::new(&raw const mem3[..], 3 * region_size),
+                    ],
+                    region_size as usize,
+                )
+            };
+
+            mapping.initialize().unwrap();
+            let (index, region) = mapping.find_region(2 * region_size).unwrap();
+            assert_eq!(index, 2);
+            assert_eq!(region.host_buffer().ptr().cast::<u8>(), mem2.as_ptr());
+            let mut new_region = region.clone();
+            unsafe {
+                new_region.redirect(&raw const mem4[..]);
+                mapping.replace_region(2, new_region).unwrap();
+            }
+
+            let (index, region) = mapping.find_region(2 * region_size).unwrap();
+            assert_eq!(index, 2);
+            assert_eq!(region.host_buffer().ptr().cast::<u8>(), mem4.as_ptr());
+        }
+    }
+
+    #[test]
+    fn test_regression_initialize_flushes_mapping_cache() {
+        for aligned in [true, false] {
+            let config = Config {
+                aligned_memory_mapping: aligned,
+                ..Config::default()
+            };
+            let (a, b, c) = ([0xaau8; 8], [0xbbu8; 8], [0xccu8; 8]);
+            let mut mapping = unsafe {
+                MemoryMapping::new(
+                    vec![
+                        MemoryRegion::new(&raw const a[..], MM_REGION_SIZE),
+                        MemoryRegion::new(&raw const b[..], 2 * MM_REGION_SIZE),
+                        MemoryRegion::new(&raw const c[..], 3 * MM_REGION_SIZE),
+                    ],
+                    &config,
+                    SBPFVersion::V3,
+                )
+            }
+            .unwrap();
+            let can_read = |m: &MemoryMapping, addr| {
+                matches!(m.map(AccessType::Load, addr, 8), StableResult::Ok(_))
+            };
+
+            assert!(can_read(&mapping, 2 * MM_REGION_SIZE));
+            mapping.get_regions_mut()[0] = MemoryRegion::new(&raw const a[..], 4 * MM_REGION_SIZE);
+            mapping.initialize().unwrap();
+            assert!(can_read(&mapping, 2 * MM_REGION_SIZE));
+        }
+    }
+
+    #[test]
+    fn test_jit_repr_c_layouts_and_fast_stack_helper() {
+        assert_eq!(mem::size_of::<MemoryRegion>(), 32);
+        let mut stack = [0u8; 4096];
+        let ro = [1u8; 16];
+        let stack_addr = stack.as_mut_ptr() as u64;
+
+        for aligned_memory_mapping in [true, false] {
+            let config = Config {
+                aligned_memory_mapping,
+                max_call_depth: 1,
+                stack_frame_size: 4096,
+                ..Config::default()
+            };
+            let mapping = unsafe {
+                MemoryMapping::new(
+                    vec![
+                        MemoryRegion::new(&raw const ro[..], ebpf::MM_BYTECODE_START),
+                        MemoryRegion::new(&raw mut stack[..], ebpf::MM_STACK_START),
+                    ],
+                    &config,
+                    SBPFVersion::V3,
+                )
+            }
+            .unwrap();
+
+            assert_eq!(mapping.fast_stack_host_addr(4096), Some(stack_addr));
+            assert_eq!(mapping.fast_stack_host_addr(4097), None);
+            assert!(mapping.matches_jit_fast_path(&config, SBPFVersion::V3));
+
+            let base = (&raw const mapping).cast::<u8>();
+            unsafe {
+                let tag = *base.add(MemoryMapping::TAG_OFFSET);
+                assert_eq!(tag, u8::from(!aligned_memory_mapping));
+                let regions_ptr = *base
+                    .add(MemoryMapping::REGIONS_PTR_OFFSET)
+                    .cast::<*const MemoryRegion>();
+                let regions_len = *base.add(MemoryMapping::REGIONS_LEN_OFFSET).cast::<usize>();
+                assert_eq!(regions_ptr, mapping.get_regions().as_ptr());
+                assert_eq!(regions_len, mapping.get_regions().len());
+
+                if aligned_memory_mapping {
+                    let va_bits = *base
+                        .add(MemoryMapping::ALIGNED_VA_BITS_OFFSET)
+                        .cast::<u32>();
+                    assert_eq!(va_bits, config.aligned_region_size.trailing_zeros());
+                } else {
+                    // Populate MappingCache entry 3 via find_region on bytecode
+                    assert!(mapping.find_region(ebpf::MM_BYTECODE_START).is_some());
+                    let entry3_base =
+                        base.add(MemoryMapping::UNALIGNED_CACHE_ENTRIES_OFFSET + 3 * 24);
+                    let start = *entry3_base
+                        .add(MappingCacheEntry::VM_ADDR_START_OFFSET)
+                        .cast::<u64>();
+                    let len = *entry3_base
+                        .add(MappingCacheEntry::VM_LEN_OFFSET)
+                        .cast::<u64>();
+                    let idx = *entry3_base
+                        .add(MappingCacheEntry::REGION_INDEX_OFFSET)
+                        .cast::<usize>();
+                    assert_eq!(start, ebpf::MM_BYTECODE_START);
+                    assert_eq!(len, ro.len() as u64);
+                    assert_eq!(idx, 0);
+                }
+            }
+        }
+
+        // Gapped or immutable stack must return None from fast_stack_host_addr
+        let config = Config {
+            max_call_depth: 1,
+            stack_frame_size: 2,
+            ..Config::default()
+        };
+        let mut gapped_buf = [0u8; 8];
+        let gapped_mapping = unsafe {
+            MemoryMapping::new(
+                vec![MemoryRegion::new_gapped(
+                    &raw mut gapped_buf[..],
+                    ebpf::MM_STACK_START,
+                    2,
+                )],
+                &config,
+                SBPFVersion::V3,
+            )
+        }
+        .unwrap();
+        assert_eq!(gapped_mapping.fast_stack_host_addr(2), None);
+        assert!(!gapped_mapping.matches_jit_fast_path(&config, SBPFVersion::V3));
+
+        let ro_stack_mapping = unsafe {
+            MemoryMapping::new(
+                vec![MemoryRegion::new(
+                    &raw const stack[..],
+                    ebpf::MM_STACK_START,
+                )],
+                &config,
+                SBPFVersion::V3,
+            )
+        }
+        .unwrap();
+        assert_eq!(ro_stack_mapping.fast_stack_host_addr(2), None);
+    }
+}

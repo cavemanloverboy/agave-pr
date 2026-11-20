@@ -17,6 +17,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 agave-unstable-api = []
 dev-context-only-utils = []
 dummy-for-ci-check = []
+j6 = ["solana-sbpf/j6"]
 stable-abi = []
 
 [dependencies]

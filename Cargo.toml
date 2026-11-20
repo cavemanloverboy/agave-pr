@@ -135,6 +135,9 @@ exclude = [
     "dev-bins",
     "programs/sbf",
     "svm/tests/example-programs",
+    "vendor/solana-sbpf",
+    "vendor/solana-sbpf-j6",
+    "vendor/solana-sbpf-prod",
 ]
 
 resolver = "2"
@@ -635,3 +638,6 @@ blstrs = { git = "https://github.com/anza-xyz/blstrs", rev = "a1faffa3420bdaf410
 crossbeam-epoch = { git = "https://github.com/anza-xyz/crossbeam", rev = "5ee1c6ec671d94db14ed9238eb99e59a84555aad" }
 librocksdb-sys = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
 rocksdb = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
+# crates.io solana-sbpf 0.28.0 by default; the `j6` feature switches to anza-xyz/sbpf c5908d1
+# (v0.28.0 + #262 + #315 + #319) with the J6 JIT changes
+solana-sbpf = { path = "vendor/solana-sbpf" }

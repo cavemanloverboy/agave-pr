@@ -528,6 +528,7 @@ dependencies = [
  "solana-rpc-client",
  "solana-rpc-client-api",
  "solana-runtime",
+ "solana-sbpf",
  "solana-sdk-ids",
  "solana-send-transaction-service",
  "solana-signer",
@@ -10360,8 +10361,32 @@ checksum = "dcf09694a0fc14e5ffb18f9b7b7c0f15ecb6eac5b5610bf76a1853459d19daf9"
 [[package]]
 name = "solana-sbpf"
 version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05a2cb47f2fb18caa76f789e5dffd84bef5d3995152edc21f3c19033c13c3efb"
+dependencies = [
+ "solana-sbpf-j6",
+ "solana-sbpf-prod",
+]
+
+[[package]]
+name = "solana-sbpf-j6"
+version = "0.28.0"
+dependencies = [
+ "byteorder",
+ "combine 3.8.1",
+ "gdbstub",
+ "hash32",
+ "libc",
+ "log",
+ "qualifier_attr",
+ "rand 0.8.6",
+ "rustc-demangle",
+ "shuttle",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.0",
+]
+
+[[package]]
+name = "solana-sbpf-prod"
+version = "0.28.0"
 dependencies = [
  "byteorder",
  "combine 3.8.1",
